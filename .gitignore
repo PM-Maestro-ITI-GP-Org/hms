@@ -1,0 +1,8 @@
+build/
+*.o
+
+# Private keys. ssh/keys/*.pub is fine; the matching private half is not,
+# and neither is anything the OTA flow needs to reach the package server.
+id_*
+!*.pub
+*.pem
