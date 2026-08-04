@@ -29,7 +29,10 @@
 
 #define OTA_STAGE_DIR "/tmp/ota"
 #define REMOTE_UPLOAD_DIR "/home/maxmaster/uploads"
-#define SCP_COMMON_OPTS "-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=60"
+/* accept-new rather than no: the OTA server's key is pinned on the first
+ * transfer and a change is refused after, which is what stops an update being
+ * fetched from whatever answers on that address. Nothing prompts either way. */
+#define SCP_COMMON_OPTS "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=60"
 
 typedef struct {
     hms_mqtt_t *mqtt;

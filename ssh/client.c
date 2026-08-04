@@ -37,8 +37,20 @@ static int file_exists(const char *path)
 static void build_ssh_opts(const Guest *g, char *opts, size_t sz, int for_scp)
 {
     int n = snprintf(opts, sz,
-        "-o StrictHostKeyChecking=no "
-        "-o UserKnownHostsFile=/dev/null "
+        /* accept-new, not no -- and no UserKnownHostsFile=/dev/null.
+         *
+         * Those two together meant every connection accepted whatever
+         * answered and then threw the evidence away, so a guest could be
+         * impersonated by anything that got onto the wire and nothing would
+         * ever notice. They were there because guests regenerated their host
+         * key on every boot, which made real checking impossible.
+         *
+         * They no longer do: the QNX guest ships a key generated at build
+         * time and the host ships it in known_hosts, so that one is verified
+         * from the very first connection. accept-new covers the guest that
+         * still generates its own -- it pins on first contact and refuses a
+         * change after, without ever prompting. */
+        "-o StrictHostKeyChecking=accept-new "
         "-o LogLevel=ERROR "
         "-o ConnectTimeout=5 "
         "%s %d",
