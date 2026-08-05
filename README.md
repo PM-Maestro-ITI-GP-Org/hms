@@ -148,6 +148,42 @@ A guest found this way is **adopted**: the PID is written back to
 `.hms_metadata`, so `kill`, `restart` and OTA work on it exactly as if HMS had
 started it, and the next refresh takes the cheap path.
 
+### The address, which adoption also needs
+
+`ip=` in `.hms_metadata` was the only place an address was ever read from, and
+only `guest_start()` ever wrote one. An adopted guest therefore had a PID and no
+address — correctly reported `running`, and reachable by nothing: every ssh path
+checks the address first and gives up on an empty one, so the guest appeared
+running and nameless with every command against it failing.
+
+Discovery now fills it in. First answer wins:
+
+| | source |
+| --- | --- |
+| 1 | `ip=` in `.hms_metadata` |
+| 2 | the host-side `vp*` link bound to this guest |
+| 3 | a default for the guest's type — `10.0.0.2` QNX, `10.0.1.2` Linux/Android |
+
+Signal 2 is read off the running host rather than assumed. `vpctl` with no
+assignments reports the binding it already has:
+
+```
+$ vpctl vp0
+vp0: peer=/dev/qvm/guest_1/guest_to_host bind=/dev/vdevpeers/vp0 ...
+```
+
+and the peer path carries the same `system` name the guest's `.qvmconf` does.
+`vp0` is guest-1 only because `.vdev_net_start.sh` binds them in that order, so
+matching on the name rather than the index is what keeps a third guest from
+breaking it. The guest's own address is then the host end of that link **+1** —
+both images put the host at `.1` of the `/24` and the guest at `.2`. That part is
+a convention, not a reading: the guest configures its address inside itself and
+the host cannot see it. Renumbering the link still works — move the host to
+`10.9.0.1` and the guest is looked for at `10.9.0.2`.
+
+Whatever it resolves to is written back to `.hms_metadata`, so it is read from
+the file from then on, and an address put there by hand always wins.
+
 Signal 3 is deliberately conservative. `guest_start()` execs `qvm @<basename>`
 with the guest directory as its cwd, so the directory is not on the command line
 and the basename is often all there is — and two guests may ship a file of the

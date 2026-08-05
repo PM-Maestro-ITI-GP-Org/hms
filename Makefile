@@ -48,7 +48,7 @@ TARGET    := $(BUILD_DIR)/hms
 # has ever built, and adding it would be a decision rather than an omission
 # being corrected.
 SRCS := main.c \
-        guest/guest.c guest/discoverer.c guest/lifecycle.c \
+        guest/guest.c guest/discoverer.c guest/lifecycle.c guest/address.c \
         ssh/client.c ssh/session_pool.c ssh/shell.c \
         config/config.c \
         utils/proc.c \

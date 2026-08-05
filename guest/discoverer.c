@@ -1,4 +1,5 @@
 #include "discoverer.h"
+#include "address.h"
 #include "../utils/proc.h"
 #include "../ssh/client.h"
 #include "lifecycle.h"
@@ -34,6 +35,36 @@ static const char *name_cache_get(const char *id)
         if (name_cache[i].id[0] && strcmp(name_cache[i].id, id) == 0)
             return name_cache[i].name[0] ? name_cache[i].name : NULL;
     return NULL;
+}
+
+/*
+ * Addresses resolved for guests whose .hms_metadata had none. Same reason as
+ * the hostname cache above -- the Guest array is rebuilt from scratch twice a
+ * second -- plus one of its own: resolving runs vpctl, and a guest whose
+ * metadata file cannot be written would otherwise fork one every cycle forever.
+ */
+static struct {
+    char id[GUEST_ID_LEN];
+    char ip[GUEST_IP_LEN];
+} ip_cache[MAX_GUESTS];
+
+static const char *ip_cache_get(const char *id)
+{
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (ip_cache[i].id[0] && strcmp(ip_cache[i].id, id) == 0)
+            return ip_cache[i].ip;
+    return NULL;
+}
+
+static void ip_cache_put(const char *id, const char *ip)
+{
+    for (int i = 0; i < MAX_GUESTS; i++) {
+        if (!ip_cache[i].id[0]) {
+            snprintf(ip_cache[i].id, sizeof(ip_cache[i].id), "%s", id);
+            snprintf(ip_cache[i].ip, sizeof(ip_cache[i].ip), "%s", ip);
+            return;
+        }
+    }
 }
 
 static void name_cache_put(const char *id, const char *name)
@@ -123,6 +154,35 @@ static void path_join(char *out, size_t out_sz, const char *a, const char *b)
     }
 }
 
+/*
+ * Give the guest an address when .hms_metadata does not carry one, and write it
+ * back so the file is the answer from here on.
+ *
+ * Adoption recorded pid= and stopped there, which left the more important half
+ * missing: a guest started outside HMS was correctly reported RUNNING and then
+ * could not be reached at all. Every ssh path -- the hostname fetch, OTA, any
+ * command the GUI sends -- checks g->ip first and gives up on an empty one, so
+ * the guest showed up as running and nameless, with nothing working on it.
+ */
+static void guest_fill_ip(Guest *g)
+{
+    const char *cached = ip_cache_get(g->id);
+    if (cached) {
+        snprintf(g->ip, sizeof(g->ip), "%s", cached);
+        return;
+    }
+
+    char ip[GUEST_IP_LEN];
+    if (guest_resolve_ip(g, ip, sizeof(ip)) != 0)
+        return;
+
+    snprintf(g->ip, sizeof(g->ip), "%s", ip);
+    ip_cache_put(g->id, ip);
+    guest_meta_set(g, "ip", ip);
+    printf("  [hms] guest '%s' had no ip in .hms_metadata -- resolved %s\n",
+           g->id, ip);
+}
+
 static void discover_one(Guest *g, const char *dir_name)
 {
     memset(g, 0, sizeof(*g));
@@ -181,6 +241,13 @@ static void discover_one(Guest *g, const char *dir_name)
                                g->ssh_password, sizeof(g->ssh_password),
                                g->ssh_key, sizeof(g->ssh_key),
                                &g->ssh_port, &g->pid);
+
+        /* No ip= in the file, or no file: derive one and record it. Runs for a
+           stopped guest too -- the host's vdevpeer links are bound at host boot
+           and do not depend on the guest running, so the address is knowable
+           before anything has started. */
+        if (g->ip[0] == '\0')
+            guest_fill_ip(g);
     }
 }
 
