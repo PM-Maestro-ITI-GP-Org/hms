@@ -124,6 +124,38 @@ Guest type is detected automatically from guest.conf:
 - `kernel=` → Linux
 - `bootimg=` → Android
 
+### How a guest is found to be running
+
+Three independent signals, strongest first. Any one of them is enough.
+
+| | signal | gives |
+| --- | --- | --- |
+| 1 | `pid=` in `.hms_metadata`, still a live `qvm` | state + PID |
+| 2 | `/dev/qvm/<system>` exists | state |
+| 3 | a `qvm` in `/proc` whose command line names this guest | state + PID |
+
+**2 and 3 are what make a guest started outside HMS visible.** Only signal 1
+existed before, and `pid=` is written by `guest_start()` — so a guest launched
+from the console or a boot script was reported `stopped` while plainly running,
+and the GUI offered **Start** for it. Pressing that ran a second `qvm` against a
+guest that already owned its vdevs.
+
+`<system>` is the `system` directive in the guest's `.qvmconf`; `qvm` publishes
+that directory for as long as the guest lives, which is the same thing the host's
+`vpctl` binds to at `/dev/qvm/guest_1/guest_to_host`.
+
+A guest found this way is **adopted**: the PID is written back to
+`.hms_metadata`, so `kill`, `restart` and OTA work on it exactly as if HMS had
+started it, and the next refresh takes the cheap path.
+
+Signal 3 is deliberately conservative. `guest_start()` execs `qvm @<basename>`
+with the guest directory as its cwd, so the directory is not on the command line
+and the basename is often all there is — and two guests may ship a file of the
+same name. A command line matching more than one guest is treated as naming
+none: a wrong PID here is a `kill` aimed at the wrong guest. In that case the
+guest still shows as `running` with PID `0`, and `kill` says why it cannot act
+rather than claiming the guest is stopped.
+
 ## Guest directory layout
 
 ```

@@ -18,8 +18,11 @@ static void msleep(long ms)
 }
 
 /* Set/update one key=value line in /guests/<id>/.hms_metadata, preserving all
-   other keys. Writes atomically via a temp file + rename. */
-static void meta_set(const Guest *g, const char *key, const char *val)
+   other keys. Writes atomically via a temp file + rename.
+
+   Not static any more: the discoverer writes pid= too, when it adopts a guest
+   that was started outside HMS. One writer for the file, whoever calls it. */
+void guest_meta_set(const Guest *g, const char *key, const char *val)
 {
     char path[GUEST_PATH_LEN];
     snprintf(path, sizeof(path), "/guests/%s/.hms_metadata", g->id);
@@ -127,7 +130,7 @@ int guest_start(const Guest *g)
     /* Store the PID in .hms_metadata for the discoverer to find later */
     char pid_str[32];
     snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
-    meta_set(g, "pid", pid_str);
+    guest_meta_set(g, "pid", pid_str);
 
     /* Clean up any legacy qvm.pid file from older builds */
     char pidfile[GUEST_PATH_LEN];
@@ -146,8 +149,19 @@ int guest_start(const Guest *g)
 
 int guest_kill(const Guest *g)
 {
-    if (g->state != GUEST_RUNNING || g->pid <= 0) {
+    if (g->state != GUEST_RUNNING) {
         printf("  [hms] guest '%s' is not running\n", g->id);
+        return -1;
+    }
+
+    /* Running, but no process to signal. That is the adopted case where
+       /dev/qvm/<system> proves the guest is up and no qvm command line could be
+       matched to it -- say so, rather than "not running", which is the one
+       thing it definitely is. */
+    if (g->pid <= 0) {
+        printf("  [hms] guest '%s' is running but HMS has no PID for it "
+               "(started outside HMS and its qvm could not be identified); "
+               "kill it from the console with 'slay qvm'\n", g->id);
         return -1;
     }
 
@@ -163,7 +177,7 @@ int guest_kill(const Guest *g)
     }
 
     /* Clear the stored PID (metadata file keeps ip=/ssh_* settings) */
-    meta_set(g, "pid", "0");
+    guest_meta_set(g, "pid", "0");
 
     /* Remove legacy PID file */
     char pidfile[GUEST_PATH_LEN];
@@ -197,7 +211,7 @@ void guest_set_ip(const Guest *g)
         fclose(f);
     }
 
-    meta_set(g, "ip", g->ip);
+    guest_meta_set(g, "ip", g->ip);
     printf("  [hms] IP %s saved to %s\n", g->ip, meta);
 }
 

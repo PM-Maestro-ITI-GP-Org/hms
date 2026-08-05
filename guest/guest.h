@@ -42,6 +42,14 @@ typedef struct {
     char        ssh_key[GUEST_KEY_LEN];
     int         ssh_port;
     time_t      name_ts;   /* last attempt to fetch the SSH hostname */
+    /* The qvmconf's `system` name, e.g. "guest_1". qvm publishes
+       /dev/qvm/<system> while the guest runs, which is how a guest started
+       outside HMS is recognised -- see guest_system_name(). */
+    char        system_name[GUEST_NAME_LEN];
+    /* Running, but HMS did not start it: someone launched qvm from the console
+       or a boot script. Nothing is refused because of this; it exists so the
+       adoption can be logged once rather than every refresh cycle. */
+    int         adopted;
 } Guest;
 
 const char *guest_type_str(GuestType t);
@@ -58,5 +66,12 @@ int guest_boot_image(const Guest *g, char *out, size_t sz);
 
 /* Return the guest's HMS metadata path (.hms_metadata: ip=, ssh_*, pid=). */
 const char *guest_meta_conf(const Guest *g);
+
+/*
+ * Read the `system` name out of the guest's qvmconf -- the name qvm publishes
+ * itself under as /dev/qvm/<name>. Returns 0 and writes the name, -1 if the
+ * file has no `system` directive.
+ */
+int guest_system_name(const Guest *g, char *out, size_t sz);
 
 #endif

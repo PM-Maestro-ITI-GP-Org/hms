@@ -1,6 +1,7 @@
 #include "discoverer.h"
 #include "../utils/proc.h"
 #include "../ssh/client.h"
+#include "lifecycle.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -167,6 +168,10 @@ static void discover_one(Guest *g, const char *dir_name)
         char boot[GUEST_PATH_LEN];
         if (guest_boot_image(g, boot, sizeof(boot)) == 0)
             snprintf(g->boot_path, sizeof(g->boot_path), "%s", boot);
+        /* The name qvm publishes itself under while this guest runs. Read here,
+           once per discovery, because refresh_guest_state() needs it on every
+           cycle and it cannot change while the guest is up. */
+        guest_system_name(g, g->system_name, sizeof(g->system_name));
         /* HMS metadata (ip, ssh_*, pid) lives in its own .hms_metadata file,
            never in the guest's partition files. */
         if (access(meta_file, F_OK) == 0)
@@ -206,33 +211,204 @@ int discover_guests(Guest out[MAX_GUESTS])
     return count;
 }
 
+/* Is `pid` a live qvm process? */
+static int pid_is_qvm(int pid, char *cmdline, size_t cmd_sz)
+{
+    if (pid <= 0) return 0;
+
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    if (access(proc_path, F_OK) != 0) return 0;
+
+    char local[4096];
+    char *buf = cmdline ? cmdline : local;
+    size_t sz = cmdline ? cmd_sz : sizeof(local);
+
+    if (!read_proc_cmdline(pid, buf, sz)) return 0;
+    return strstr(buf, "qvm") != NULL;
+}
+
+/*
+ * Does this qvm command line belong to this guest?
+ *
+ * guest_start() execs `qvm @<conf basename>` with cwd /guests/<id>, so the
+ * directory is not on the command line and the basename is all there is. A
+ * guest started by hand may equally have been launched with the full path.
+ * Accept either, and accept the id itself for a launcher that names it.
+ *
+ * The basename alone is weak evidence -- two guests can both ship a file called
+ * qnx-guest.qvmconf -- so the caller only trusts it when it matches exactly one
+ * guest. That is what the match count in find_qvm_pid() below is for.
+ */
+static int cmdline_names_guest(const char *cmdline, const Guest *g)
+{
+    if (g->conf_path[0] && strstr(cmdline, g->conf_path))
+        return 1;
+
+    char dir[GUEST_PATH_LEN];
+    snprintf(dir, sizeof(dir), "/guests/%s/", g->id);
+    if (strstr(cmdline, dir))
+        return 1;
+
+    const char *base = strrchr(g->conf_path, '/');
+    base = base ? base + 1 : g->conf_path;
+    if (base[0] && strstr(cmdline, base))
+        return 1;
+
+    return 0;
+}
+
+/*
+ * Find the live qvm process belonging to this guest by scanning /proc.
+ * Returns its pid, or 0 if there is no unambiguous match.
+ */
+static int find_qvm_pid(const Guest *g)
+{
+    int pids[512];
+    int n = scan_proc(pids, (int)(sizeof(pids) / sizeof(pids[0])));
+
+    int found = 0, matches = 0;
+    for (int i = 0; i < n; i++) {
+        char cmdline[4096];
+        if (!pid_is_qvm(pids[i], cmdline, sizeof(cmdline)))
+            continue;
+        if (!cmdline_names_guest(cmdline, g))
+            continue;
+        matches++;
+        found = pids[i];
+    }
+
+    /* Two processes claiming the same guest means the evidence is the shared
+       basename and not the guest. Report nothing rather than the wrong pid --
+       a wrong pid here is a kill command aimed at another guest. */
+    return matches == 1 ? found : 0;
+}
+
+/*
+ * Is the guest running, regardless of who started it?
+ *
+ * qvm publishes /dev/qvm/<system> for as long as the guest lives, so this is
+ * the one signal that does not depend on HMS having been the one to launch it.
+ * It is also what the host's own vdevpeer setup already relies on:
+ * /dev/qvm/guest_1/guest_to_host is where vpctl binds.
+ */
+static int qvm_dev_present(const Guest *g)
+{
+    if (!g->system_name[0]) return 0;
+
+    char path[GUEST_PATH_LEN];
+    snprintf(path, sizeof(path), "/dev/qvm/%s", g->system_name);
+
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/*
+ * Which guests we have already announced as adopted, and as which pid.
+ * discover_guests() rebuilds the Guest array from scratch every cycle -- twice
+ * a second in the main loop -- so a flag in the struct cannot remember this and
+ * the message would be printed forever.
+ */
+static struct {
+    char id[GUEST_ID_LEN];
+    int  pid;
+} adopt_log[MAX_GUESTS];
+
+static int adopt_announce(const char *id, int pid)
+{
+    for (int i = 0; i < MAX_GUESTS; i++) {
+        if (adopt_log[i].id[0] && strcmp(adopt_log[i].id, id) == 0) {
+            if (adopt_log[i].pid == pid) return 0;
+            adopt_log[i].pid = pid;
+            return 1;
+        }
+    }
+    for (int i = 0; i < MAX_GUESTS; i++) {
+        if (!adopt_log[i].id[0]) {
+            snprintf(adopt_log[i].id, sizeof(adopt_log[i].id), "%s", id);
+            adopt_log[i].pid = pid;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void adopt_forget(const char *id)
+{
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (adopt_log[i].id[0] && strcmp(adopt_log[i].id, id) == 0)
+            adopt_log[i].id[0] = '\0';
+}
+
+/*
+ * Work out whether the guest is running and, if so, which process it is.
+ *
+ * The old version asked one question -- "is the pid HMS wrote to .hms_metadata
+ * still alive?" -- and so could only ever see guests HMS had started itself. A
+ * guest launched from the console or a boot script had no pid recorded, was
+ * reported STOPPED while plainly running, and the GUI offered Start for it:
+ * pressing that ran a second qvm against a guest that already owned its vdevs.
+ *
+ * Three independent signals now, strongest first. Any one of them is enough to
+ * call the guest running.
+ */
 void refresh_guest_state(Guest *g)
 {
     g->state = GUEST_STOPPED;
     g->pid   = 0;
 
-    /* Read the PID stored by guest_start() in .hms_metadata */
+    /* 1. The pid HMS recorded, if it is still a live qvm. Cheapest, and the
+          common case for a guest HMS started. */
     char meta[GUEST_PATH_LEN];
     snprintf(meta, sizeof(meta), "/guests/%s/.hms_metadata", g->id);
 
-    int pid = 0;
-    parse_conf_network(meta, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, &pid);
-    if (pid <= 0) return;
+    int meta_pid = 0;
+    parse_conf_network(meta, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, &meta_pid);
 
-    /* Verify the process is still alive and is qvm; the metadata file itself
-       is kept (it also holds ip=/ssh_* settings), only the state is cleared. */
-    char proc_path[64];
-    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
-    if (access(proc_path, F_OK) != 0)
-        return;
-
-    char cmdline[4096];
-    if (!read_proc_cmdline((int)pid, cmdline, sizeof(cmdline)))
-        return;
-
-    if (strstr(cmdline, "qvm") != NULL) {
-        g->pid   = (int)pid;
+    if (meta_pid > 0 && pid_is_qvm(meta_pid, NULL, 0)) {
+        g->pid   = meta_pid;
         g->state = GUEST_RUNNING;
+        return;
+    }
+
+    /* 2. /dev/qvm/<system>, and 3. a qvm in /proc whose command line names this
+          guest. Either alone establishes that it is running; together they also
+          give the pid, which is what kill and restart need. */
+    int dev_up = qvm_dev_present(g);
+
+    /* The /proc scan is the expensive half -- every pid, every cmdline -- and
+       this runs twice a second. Skip it for a guest /dev/qvm says is down,
+       which is the steady state for a stopped guest. A guest whose qvmconf has
+       no `system` line has no such answer, so it is scanned regardless. */
+    int scan_pid = (dev_up || !g->system_name[0]) ? find_qvm_pid(g) : 0;
+
+    if (!dev_up && scan_pid == 0) {
+        adopt_forget(g->id);            /* genuinely stopped */
+        return;
+    }
+
+    g->state = GUEST_RUNNING;
+    g->pid   = scan_pid;                /* 0 if the scan could not name it */
+
+    /* Adopt it: record the pid so kill/restart work on a guest HMS did not
+       start, and so the next cycle takes the cheap path above. A guest we know
+       is running but cannot name a process for keeps pid 0 -- reporting it as
+       stopped would be worse, and writing a guessed pid far worse than that. */
+    if (scan_pid > 0) {
+        char pid_str[32];
+        snprintf(pid_str, sizeof(pid_str), "%d", scan_pid);
+        guest_meta_set(g, "pid", pid_str);
+    }
+
+    g->adopted = 1;
+    if (adopt_announce(g->id, scan_pid)) {
+        if (scan_pid > 0)
+            printf("  [hms] guest '%s' was already running as PID %d "
+                   "(started outside HMS) -- adopted\n", g->id, scan_pid);
+        else
+            printf("  [hms] guest '%s' is running: /dev/qvm/%s exists, but no "
+                   "qvm process could be matched to it, so kill and restart "
+                   "are unavailable for it\n", g->id, g->system_name);
     }
 }
 

@@ -98,6 +98,35 @@ int guest_boot_image(const Guest *g, char *out, size_t sz)
     return -1;
 }
 
+int guest_system_name(const Guest *g, char *out, size_t sz)
+{
+    if (!g->conf_path[0]) return -1;
+
+    FILE *f = fopen(g->conf_path, "r");
+    if (!f) return -1;
+
+    int rc = -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#') continue;
+        /* "system <name>" at the top level of the qvmconf. Not "system=": qvm
+           takes the value as an argument, not an assignment. */
+        if (strncmp(p, "system", 6) != 0) continue;
+        if (p[6] != ' ' && p[6] != '\t') continue;
+
+        char *tok = strtok(p + 6, " \t\r\n");
+        if (tok && *tok) {
+            snprintf(out, sz, "%s", tok);
+            rc = 0;
+        }
+        break;
+    }
+    fclose(f);
+    return rc;
+}
+
 const char *guest_meta_conf(const Guest *g)
 {
     static char buf[GUEST_PATH_LEN];

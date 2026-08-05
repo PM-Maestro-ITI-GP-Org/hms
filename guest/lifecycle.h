@@ -27,4 +27,10 @@ int guest_restart(const Guest *g);
  */
 void guest_set_ip(const Guest *g);
 
+/*
+ * Set one key=value line in /guests/<id>/.hms_metadata, preserving the rest.
+ * Written atomically (temp file + rename).
+ */
+void guest_meta_set(const Guest *g, const char *key, const char *val);
+
 #endif
