@@ -13,6 +13,20 @@
 char *ssh_exec(const Guest *g, const char *command);
 
 /*
+ * As ssh_exec, but reports why it failed.
+ *
+ * On NULL, errbuf holds ssh's own stderr (\"Permission denied (publickey)\",
+ * \"No route to host\", ...) rather than the caller having to guess. Without
+ * this every failure reached the GUI as the same \"(no output / SSH failed)\",
+ * which is a message that cannot be acted on.
+ *
+ * stderr is captured separately from stdout on purpose: callers parse stdout,
+ * so merging the two would corrupt it.
+ */
+char *ssh_exec_diag(const Guest *g, const char *command,
+                    char *errbuf, size_t errbuf_sz);
+
+/*
  * Copy a local file into a guest via SCP.
  * Uses the same auth selection as ssh_exec (key / sshpass / agent).
  * Returns 0 on success, non-zero otherwise.

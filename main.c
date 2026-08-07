@@ -313,8 +313,23 @@ static void cmd_exec(const char *id, const char *command)
        and then free()d unconditionally at the end -- so every failed exec,
        which is exactly when a guest is unreachable, freed a pointer into
        read-only memory and took HMS down with it. */
-    char *out = ssh_exec(&g, command);
-    const char *text = out ? out : "(no output / SSH failed)";
+    char ssherr[512];
+    char *out = ssh_exec_diag(&g, command, ssherr, sizeof(ssherr));
+
+    /* Say what actually went wrong. "(no output / SSH failed)" was the same
+       string for a wrong key, an unreachable address and a command that simply
+       printed nothing, so the Remote Shell could not be debugged from the GUI
+       at all. */
+    char failtext[600];
+    const char *text;
+    if (out) {
+        text = out;
+    } else {
+        snprintf(failtext, sizeof(failtext), "ssh to %s failed: %s",
+                 g.ip[0] ? g.ip : "(no address)",
+                 ssherr[0] ? ssherr : "no output and no error text");
+        text = failtext;
+    }
 
     char escaped[4096];
     escape_json(text, escaped, sizeof(escaped));
@@ -334,8 +349,16 @@ static void cmd_exec(const char *id, const char *command)
    (QNX 'hostname' does). QNX 8 notes: no 'uptime' binary (load comes from
    'pidin cpu'), RAM from 'pidin info' FreeMem, and per-process CPU time
    from 'ps -A' (plain 'pidin' prints a thread table without TIME). */
+/* `uname -n`, not `hostname`.
+ *
+ * The host image links /bin/hostname to toybox, but this toybox is not built
+ * with a hostname applet -- so the very first command of every stats poll
+ * printed `toybox: Unknown command hostname` to the console and returned
+ * nothing, several times a second while the Monitor tab was open. `uname -n`
+ * gives the same node name, is in this toybox's applet list, and is POSIX, so
+ * it works inside a Linux guest too. */
 static const char STATS_CMD[] =
-    "echo; echo '###HOSTNAME'; hostname;"
+    "echo; echo '###HOSTNAME'; uname -n;"
     "echo; echo '###KERNEL'; uname -a;"
     "echo; echo '###UPTIMESEC'; cat /proc/uptime 2>/dev/null;"
     "echo; echo '###CPUINFO'; pidin info;"
@@ -398,8 +421,13 @@ static void cmd_stats(const char *id)
     char *guest_esc = malloc(262144);
     if (!guest_esc) { free(host_esc); return; }
     guest_esc[0] = '\0';
+
+    /* Why the guest half is missing, when it is. The Monitor page used to show
+       an empty guest section with no explanation whenever the SSH failed --
+       indistinguishable from the guest being stopped. */
+    char guest_err[512] = "";
     if (running) {
-        char *guest_out = ssh_exec(&g, STATS_CMD);
+        char *guest_out = ssh_exec_diag(&g, STATS_CMD, guest_err, sizeof(guest_err));
         if (guest_out) {
             escape_json(guest_out, guest_esc, 262144);
             free(guest_out);
@@ -408,13 +436,17 @@ static void cmd_stats(const char *id)
         }
     }
 
+    char err_esc[1024];
+    escape_json(guest_err, err_esc, sizeof(err_esc));
+
     char *buf = malloc(786432);
     if (buf) {
         snprintf(buf, 786432,
                  "{\"state\":\"monitor_stats\",\"guest_id\":\"%s\","
-                 "\"guest_running\":%s,"
+                 "\"guest_running\":%s,\"guest_error\":\"%s\","
                  "\"host\":\"%s\",\"guest\":\"%s\"}",
-                 guest_id, running ? "true" : "false", host_esc, guest_esc);
+                 guest_id, running ? "true" : "false", err_esc,
+                 host_esc, guest_esc);
         hms_mqtt_publish_status(&mqtt, buf);
         free(buf);
     }
@@ -669,64 +701,66 @@ static void cmd_shellclose(const char *id)
         publish_result("shellclose", id, 1, "shell closed");
 }
 
-static void handle_command(void *userdata, const char *cmd)
+static void dispatch_command(const char *cmd)
 {
-    (void)userdata;
     printf("[hms] cmd: %s\n", cmd);
 
-    /* tokenize: first token = action, rest = arguments */
+    /* tokenize: first token = action, rest = arguments.
+       strtok keeps state in the library, so this must not run on two threads
+       at once -- see the worker pool below, which serialises entry here. */
     char buf[2048];
     snprintf(buf, sizeof(buf), "%s", cmd);
-    char *action = strtok(buf, " ");
+    char *save = NULL;
+    char *action = strtok_r(buf, " ", &save);
     if (!action) return;
 
     if (strcmp(action, "list") == 0) {
         cmd_list();
     }
     else if (strcmp(action, "start") == 0) {
-        char *id = strtok(NULL, " ");
-        char *ip = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
+        char *ip = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("start", NULL, 0, "usage: start <guest> [ip]"); return; }
         cmd_start(id, ip ? ip : "");
     }
     else if (strcmp(action, "kill") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("kill", NULL, 0, "usage: kill <guest>"); return; }
         cmd_kill(id);
     }
     else if (strcmp(action, "info") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("info", NULL, 0, "usage: info <guest>"); return; }
         cmd_info(id);
     }
     else if (strcmp(action, "exec") == 0) {
-        char *id = strtok(NULL, " ");
-        char *rest = strtok(NULL, "");
+        char *id = strtok_r(NULL, " ", &save);
+        char *rest = strtok_r(NULL, "", &save);
         if (!id || !rest) { publish_result("exec", NULL, 0, "usage: exec <guest> <command>"); return; }
         cmd_exec(id, rest);
     }
     else if (strcmp(action, "stats") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         cmd_stats(id ? id : "");
     }
     else if (strcmp(action, "ota") == 0) {
-        char *id = strtok(NULL, " ");
-        char *rest = strtok(NULL, "");
+        char *id = strtok_r(NULL, " ", &save);
+        char *rest = strtok_r(NULL, "", &save);
         if (!id || !rest) { publish_result("ota", NULL, 0, "usage: ota <guest> <remote_path>"); return; }
         cmd_ota(id, rest);
     }
     else if (strcmp(action, "files") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("files", NULL, 0, "usage: files <guest>"); return; }
         cmd_files(id);
     }
     else if (strcmp(action, "fetch") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("fetch", NULL, 0, "usage: fetch <guest> <file> [<file>...]"); return; }
         char paths[OTA_APPLY_MAX_FILES][1024];
         int n = 0, dropped = 0;
         char *t;
-        while ((t = strtok(NULL, " ")) != NULL) {
+        while ((t = strtok_r(NULL, " ", &save)) != NULL) {
             if (n < OTA_APPLY_MAX_FILES)
                 snprintf(paths[n++], sizeof(paths[0]), "%s", t);
             else
@@ -750,31 +784,31 @@ static void handle_command(void *userdata, const char *cmd)
         cmd_fetch(id, paths, n);
     }
     else if (strcmp(action, "apply") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("apply", NULL, 0, "usage: apply <guest>"); return; }
-        char *t = strtok(NULL, " ");
+        char *t = strtok_r(NULL, " ", &save);
         int restart = (t && strcmp(t, "--no-restart") == 0) ? 0 : 1;
         cmd_apply(id, restart);
     }
     else if (strcmp(action, "pushfiles") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("pushfiles", NULL, 0, "usage: pushfiles <guest> <serverPath>"); return; }
-        char *path = strtok(NULL, " ");
+        char *path = strtok_r(NULL, " ", &save);
         if (!path) { publish_result("pushfiles", id, 0, "no server path specified"); return; }
         cmd_pushfiles(id, path);
     }
     else if (strcmp(action, "addfile") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("addfile", NULL, 0, "usage: addfile <guest> <serverPath>"); return; }
-        char *path = strtok(NULL, " ");
+        char *path = strtok_r(NULL, " ", &save);
         if (!path) { publish_result("addfile", id, 0, "no server path specified"); return; }
         cmd_addfile(id, path);
     }
     else if (strcmp(action, "addguest") == 0) {
-        char *id = strtok(NULL, " ");
-        char *ifs = strtok(NULL, " ");
-        char *conf = strtok(NULL, " ");
-        char *ip = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
+        char *ifs = strtok_r(NULL, " ", &save);
+        char *conf = strtok_r(NULL, " ", &save);
+        char *ip = strtok_r(NULL, " ", &save);
         if (!id || !ifs || !conf) {
             publish_result("addguest", NULL, 0, "usage: addguest <guest> <ifs_path> <conf_path> [ip]");
             return;
@@ -782,18 +816,18 @@ static void handle_command(void *userdata, const char *cmd)
         cmd_addguest(id, ifs, conf, ip ? ip : "");
     }
     else if (strcmp(action, "shellopen") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("shellopen", NULL, 0, "usage: shellopen <guest>"); return; }
         cmd_shellopen(id);
     }
     else if (strcmp(action, "shellwrite") == 0) {
-        char *id = strtok(NULL, " ");
-        char *rest = strtok(NULL, "");
+        char *id = strtok_r(NULL, " ", &save);
+        char *rest = strtok_r(NULL, "", &save);
         if (!id || !rest) { publish_result("shellwrite", NULL, 0, "usage: shellwrite <guest> <data>"); return; }
         cmd_shellwrite(id, rest);
     }
     else if (strcmp(action, "shellclose") == 0) {
-        char *id = strtok(NULL, " ");
+        char *id = strtok_r(NULL, " ", &save);
         if (!id) { publish_result("shellclose", NULL, 0, "usage: shellclose <guest>"); return; }
         cmd_shellclose(id);
     }
@@ -805,9 +839,114 @@ static void handle_command(void *userdata, const char *cmd)
     }
 }
 
+/* ===================== command queue and worker pool =====================
+ *
+ * handle_command() is called by libmosquitto on its single network thread --
+ * the same thread that answers the broker's keepalive and receives every other
+ * message. Running the work there meant one slow command stopped everything:
+ *
+ *   `stats` runs `top -b -i 1` locally and then SSHes into the guest, and an
+ *   unreachable guest costs the full 5 s connect timeout. With the Monitor tab
+ *   polling every 3 s, HMS spent essentially all of its time inside stats, and
+ *   an `exec` typed into the Remote Shell sat behind it until the GUI's own
+ *   15 s timeout gave up. Long blocks there also risk the broker dropping the
+ *   session on keepalive.
+ *
+ * The network thread now only enqueues. Workers do the work, so a slow stats
+ * no longer delays a shell command.
+ */
+#define CMD_QUEUE_MAX 32
+#define CMD_WORKERS    4
+
+static struct {
+    char            items[CMD_QUEUE_MAX][2048];
+    int             head, tail, count;
+    int             stats_running;   /* see the coalescing note below */
+    pthread_mutex_t lock;
+    pthread_cond_t  cv;
+} cmdq = {
+    .head = 0, .tail = 0, .count = 0, .stats_running = 0,
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .cv   = PTHREAD_COND_INITIALIZER,
+};
+
+static int is_stats_cmd(const char *c)
+{
+    return strncmp(c, "stats", 5) == 0 && (c[5] == '\0' || c[5] == ' ');
+}
+
+static void *cmd_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        char cmd[2048];
+
+        pthread_mutex_lock(&cmdq.lock);
+        while (cmdq.count == 0 && running)
+            pthread_cond_wait(&cmdq.cv, &cmdq.lock);
+        if (cmdq.count == 0 && !running) {
+            pthread_mutex_unlock(&cmdq.lock);
+            return NULL;
+        }
+        snprintf(cmd, sizeof(cmd), "%s", cmdq.items[cmdq.head]);
+        cmdq.head = (cmdq.head + 1) % CMD_QUEUE_MAX;
+        cmdq.count--;
+        int mine_is_stats = is_stats_cmd(cmd);
+        pthread_mutex_unlock(&cmdq.lock);
+
+        dispatch_command(cmd);
+
+        if (mine_is_stats) {
+            pthread_mutex_lock(&cmdq.lock);
+            cmdq.stats_running = 0;
+            pthread_mutex_unlock(&cmdq.lock);
+        }
+    }
+}
+
+/* Called on libmosquitto's network thread. Must not block. */
+static void handle_command(void *userdata, const char *cmd)
+{
+    (void)userdata;
+
+    pthread_mutex_lock(&cmdq.lock);
+
+    /*
+     * Coalesce stats.
+     *
+     * The GUI polls every few seconds and re-sends when its own watchdog
+     * fires, so when HMS is slower than the poll interval the requests pile
+     * up -- which is exactly what the console showed, `cmd: stats` back to
+     * back with no room for anything else. An extra stats while one is
+     * already running answers a question that is about to be answered anyway,
+     * so drop it rather than queue it.
+     */
+    if (is_stats_cmd(cmd)) {
+        if (cmdq.stats_running) {
+            pthread_mutex_unlock(&cmdq.lock);
+            return;
+        }
+        cmdq.stats_running = 1;
+    }
+
+    if (cmdq.count == CMD_QUEUE_MAX) {
+        pthread_mutex_unlock(&cmdq.lock);
+        fprintf(stderr, "[hms] command queue full, dropping: %.64s\n", cmd);
+        return;
+    }
+
+    snprintf(cmdq.items[cmdq.tail], sizeof(cmdq.items[0]), "%s", cmd);
+    cmdq.tail = (cmdq.tail + 1) % CMD_QUEUE_MAX;
+    cmdq.count++;
+    pthread_cond_signal(&cmdq.cv);
+    pthread_mutex_unlock(&cmdq.lock);
+}
+
 static void on_signal(int sig)
 {
     (void)sig;
+    /* Only this. pthread_cond_broadcast() is not async-signal-safe, so waking
+       the workers is left to main() once its loop has seen the flag. */
     running = 0;
 }
 
@@ -831,6 +970,19 @@ int main(int argc, char **argv)
 
     config_load(&cfg);
     refresh();
+
+    /* Workers before the broker, so nothing arrives with nowhere to go. */
+    pthread_t workers[CMD_WORKERS];
+    int n_workers = 0;
+    for (int i = 0; i < CMD_WORKERS; i++) {
+        if (pthread_create(&workers[n_workers], NULL, cmd_worker, NULL) == 0)
+            n_workers++;
+    }
+    if (n_workers == 0) {
+        fprintf(stderr, "[hms] could not start any command workers\n");
+        return 1;
+    }
+    printf("  [hms] %d command worker(s)\n", n_workers);
 
     if (hms_mqtt_init(&mqtt, handle_command, NULL) != 0) {
         fprintf(stderr, "[hms] MQTT init failed\n");
@@ -858,6 +1010,18 @@ int main(int argc, char **argv)
     }
 
     printf("\n[hms] shutting down\n");
+
+    /* Wake the workers (the signal handler could not) and let them finish.
+       A worker inside an SSH can be up to its 5 s connect timeout away from
+       noticing, so this is not instant -- but it is bounded, and it is what
+       stops us tearing down the MQTT client under a thread still publishing
+       through it. */
+    pthread_mutex_lock(&cmdq.lock);
+    pthread_cond_broadcast(&cmdq.cv);
+    pthread_mutex_unlock(&cmdq.lock);
+    for (int i = 0; i < n_workers; i++)
+        pthread_join(workers[i], NULL);
+
     shell_close_all();
     hms_mqtt_disconnect(&mqtt);
     return 0;

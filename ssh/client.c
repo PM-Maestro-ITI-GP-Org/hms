@@ -199,14 +199,30 @@ int ssh_scp_to(const Guest *g, const char *local_path, const char *remote_path,
     return failed ? -1 : 0;
 }
 
-char *ssh_exec(const Guest *g, const char *command)
+/* Unique-per-call scratch name for capturing a command's stderr. */
+static void tmp_name(char *out, size_t sz, const char *tag)
 {
+    static unsigned int seq = 0;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    unsigned int mine = seq++;
+    pthread_mutex_unlock(&lock);
+    snprintf(out, sz, "/tmp/hms_%s_%d_%u", tag, (int)getpid(), mine);
+}
+
+char *ssh_exec_diag(const Guest *g, const char *command,
+                    char *errbuf, size_t errbuf_sz)
+{
+    if (errbuf && errbuf_sz) errbuf[0] = '\0';
+
     if (g->ip[0] == '\0') {
         printf("  [ssh] ERROR: guest '%s' has no IP address\n", g->id);
+        if (errbuf) snprintf(errbuf, errbuf_sz, "guest has no IP address");
         return NULL;
     }
     if (g->state != GUEST_RUNNING) {
         printf("  [ssh] ERROR: guest '%s' is not running\n", g->id);
+        if (errbuf) snprintf(errbuf, errbuf_sz, "guest is not running");
         return NULL;
     }
 
@@ -214,45 +230,61 @@ char *ssh_exec(const Guest *g, const char *command)
     char ssh_opts[1024];
     ssh_build_opts(g, ssh_opts, sizeof(ssh_opts), 0);
 
+    /*
+     * stderr goes to a file rather than to HMS's own console.
+     *
+     * It used to be discarded, which is why every failure looked identical:
+     * ssh printed "Permission denied (publickey)" or "No route to host" onto
+     * the host's terminal, stdout came back empty, and the caller had nothing
+     * to report but "(no output / SSH failed)". Keeping it separate from
+     * stdout matters -- callers parse stdout (the guest browser parses `ls`),
+     * so 2>&1 would corrupt it.
+     */
+    char errfile[128];
+    tmp_name(errfile, sizeof(errfile), "ssherr");
+
     char cmd[4096];
     int n;
     if (g->ssh_password[0] != '\0' && have_sshpass()) {
         /* Password auth via sshpass */
         n = snprintf(cmd, sizeof(cmd),
-            "sshpass -p '%s' ssh %s %s@%s \"%s\"",
-            g->ssh_password, ssh_opts, g->ssh_user, g->ip, command);
+            "sshpass -p '%s' ssh %s %s@%s \"%s\" 2>%s",
+            g->ssh_password, ssh_opts, g->ssh_user, g->ip, command, errfile);
     } else if (g->ssh_key[0] != '\0' && file_exists(g->ssh_key)) {
         /* Key-based auth with explicit identity */
         n = snprintf(cmd, sizeof(cmd),
-            "ssh -o BatchMode=yes %s %s@%s \"%s\"",
-            ssh_opts, g->ssh_user, g->ip, command);
+            "ssh -o BatchMode=yes %s %s@%s \"%s\" 2>%s",
+            ssh_opts, g->ssh_user, g->ip, command, errfile);
     } else if (g->ssh_password[0] != '\0') {
         /* Password configured but no sshpass and no key */
         printf("  [ssh] WARNING: password set but 'sshpass' not found and no SSH key available.\n");
         n = snprintf(cmd, sizeof(cmd),
-            "ssh -o BatchMode=yes %s %s@%s \"%s\"",
-            ssh_opts, g->ssh_user, g->ip, command);
+            "ssh -o BatchMode=yes %s %s@%s \"%s\" 2>%s",
+            ssh_opts, g->ssh_user, g->ip, command, errfile);
     } else {
         /* Default: no password, no key — rely on ssh-agent */
         n = snprintf(cmd, sizeof(cmd),
-            "ssh %s %s@%s \"%s\"",
-            ssh_opts, g->ssh_user, g->ip, command);
+            "ssh %s %s@%s \"%s\" 2>%s",
+            ssh_opts, g->ssh_user, g->ip, command, errfile);
     }
 
     if (n >= (int)sizeof(cmd)) {
         printf("  [ssh] ERROR: command too long\n");
+        if (errbuf) snprintf(errbuf, errbuf_sz, "ssh command too long");
         return NULL;
     }
 
     FILE *fp = popen(cmd, "r");
     if (!fp) {
         printf("  [ssh] ERROR: popen failed\n");
+        if (errbuf) snprintf(errbuf, errbuf_sz, "popen failed");
+        remove(errfile);
         return NULL;
     }
 
     size_t cap = 4096, len = 0;
     char *out = malloc(cap);
-    if (!out) { pclose(fp); return NULL; }
+    if (!out) { pclose(fp); remove(errfile); return NULL; }
     out[0] = '\0';
 
     char buf[1024];
@@ -261,19 +293,60 @@ char *ssh_exec(const Guest *g, const char *command)
         if (len + blen + 1 > cap) {
             cap *= 2;
             char *tmp = realloc(out, cap);
-            if (!tmp) { free(out); pclose(fp); return NULL; }
+            if (!tmp) { free(out); pclose(fp); remove(errfile); return NULL; }
             out = tmp;
         }
         memcpy(out + len, buf, blen + 1);
         len += blen;
     }
+    (void)pclose(fp);
 
-    int ret = pclose(fp);
-    if (ret != 0 && len == 0) {
+    /* Read back whatever ssh complained about. */
+    char err[512] = "";
+    FILE *ef = fopen(errfile, "r");
+    if (ef) {
+        size_t got = fread(err, 1, sizeof(err) - 1, ef);
+        err[got] = '\0';
+        fclose(ef);
+    }
+    remove(errfile);
+
+    /* Trim trailing newlines so the text sits on one line in the GUI. */
+    size_t elen = strlen(err);
+    while (elen > 0 && (err[elen - 1] == '\n' || err[elen - 1] == '\r'))
+        err[--elen] = '\0';
+    for (char *p = err; *p; p++)
+        if (*p == '\n' || *p == '\r') *p = ' ';
+
+    /*
+     * Judge the result by output and stderr, not by pclose().
+     *
+     * The old test was `pclose(fp) != 0 && len == 0`. QNX's pclose reports -1
+     * even for a child that exited 0 -- this file already says so where
+     * ssh_scp_to explains the same problem -- so that condition reduced to
+     * "no output", and every command that legitimately prints nothing (touch,
+     * mkdir, an empty directory listing) was reported as a failed SSH.
+     *
+     * Empty output with a silent stderr is now a success, which is what it is.
+     */
+    if (len == 0 && err[0]) {
+        printf("  [ssh] '%s' on %s failed: %s\n", command, g->id, err);
+        if (errbuf) snprintf(errbuf, errbuf_sz, "%s", err);
         free(out);
         return NULL;
     }
+
+    /* Succeeded, but ssh still had something to say (a host-key notice, a
+       warning). Pass it up without failing the call. */
+    if (err[0] && errbuf)
+        snprintf(errbuf, errbuf_sz, "%s", err);
+
     return out;
+}
+
+char *ssh_exec(const Guest *g, const char *command)
+{
+    return ssh_exec_diag(g, command, NULL, 0);
 }
 
 int ssh_ping(const Guest *g)

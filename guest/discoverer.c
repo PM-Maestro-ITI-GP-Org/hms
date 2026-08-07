@@ -524,7 +524,10 @@ void refresh_guest_name(Guest *g)
         return;
     g->name_ts = now;
 
-    char *out = ssh_exec(g, "hostname");
+    /* `uname -n` rather than `hostname`: the guest images carry the same
+       toybox as the host, and it has no hostname applet, so this fetch always
+       came back empty and every guest showed its name as "-". */
+    char *out = ssh_exec(g, "uname -n");
     if (!out)
         return;
 
