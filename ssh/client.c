@@ -3,26 +3,40 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/stat.h>
 
-/* Check if a command is available on the host PATH */
-static int cmd_exists(const char *cmd)
+/*
+ * Is sshpass on the host PATH?
+ *
+ * This was a fresh fork+exec of a shell writing to a /tmp file on *every*
+ * ssh_exec() -- which the discoverer calls once per guest per refresh cycle,
+ * so several times a second. Worse, the sequence counter it used to name that
+ * file was a plain static++ touched from the mosquitto callback thread, the
+ * OTA workers and the main loop at once, so two callers could pick the same
+ * name and read back each other's answer.
+ *
+ * The answer cannot change while HMS runs, so look once and remember.
+ */
+static int have_sshpass(void)
 {
-    char rcfile[128];
-    static unsigned int seq = 0;
-    snprintf(rcfile, sizeof(rcfile), "/tmp/ssh_rc_%d_%u", getpid(), seq++);
-    char buf[512];
-    snprintf(buf, sizeof(buf),
-             "command -v %s >/dev/null 2>&1; echo $? > %s", cmd, rcfile);
-    system(buf);
-    int rc = -1;
-    FILE *f = fopen(rcfile, "r");
-    if (f) {
-        if (fscanf(f, "%d", &rc) != 1) rc = -1;
-        fclose(f);
-        remove(rcfile);
+    static int cached = -1;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+    pthread_mutex_lock(&lock);
+    if (cached < 0) {
+        cached = 0;
+        FILE *fp = popen("command -v sshpass 2>/dev/null", "r");
+        if (fp) {
+            char line[256];
+            if (fgets(line, sizeof(line), fp) && line[0] == '/')
+                cached = 1;
+            pclose(fp);
+        }
     }
-    return (rc == 0);
+    int r = cached;
+    pthread_mutex_unlock(&lock);
+    return r;
 }
 
 /* Check if a file exists */
@@ -34,7 +48,7 @@ static int file_exists(const char *path)
 /* Build the shared SSH options string (host key handling + port).
    scp uses uppercase -P for the port (lowercase -p means "preserve
    times" and would treat the port number as a local file!). */
-static void build_ssh_opts(const Guest *g, char *opts, size_t sz, int for_scp)
+void ssh_build_opts(const Guest *g, char *opts, size_t sz, int for_scp)
 {
     int n = snprintf(opts, sz,
         /* accept-new, not no -- and no UserKnownHostsFile=/dev/null.
@@ -56,8 +70,9 @@ static void build_ssh_opts(const Guest *g, char *opts, size_t sz, int for_scp)
         "%s %d",
         for_scp ? "-P" : "-p",
         g->ssh_port);
+    if (n < 0 || (size_t)n >= sz) return;
     if (g->ssh_key[0] != '\0' && file_exists(g->ssh_key)) {
-        snprintf(opts + n, sz - n, " -i %s", g->ssh_key);
+        snprintf(opts + n, sz - (size_t)n, " -i %s", g->ssh_key);
     }
 }
 
@@ -87,11 +102,11 @@ int ssh_scp_to(const Guest *g, const char *local_path, const char *remote_path,
        scp defaults to the SFTP subsystem, which QNX guests often don't
        have configured; plain ssh is the same proven path as ssh_exec. */
     char ssh_opts[1024];
-    build_ssh_opts(g, ssh_opts, sizeof(ssh_opts), 0);
+    ssh_build_opts(g, ssh_opts, sizeof(ssh_opts), 0);
 
     char cmd[4096];
     int n;
-    if (g->ssh_password[0] != '\0' && cmd_exists("sshpass")) {
+    if (g->ssh_password[0] != '\0' && have_sshpass()) {
         n = snprintf(cmd, sizeof(cmd),
             "sshpass -p '%s' ssh %s %s@%s \"cat > %s\" < \"%s\" 2>&1",
             g->ssh_password, ssh_opts, g->ssh_user, g->ip, remote_path, local_path);
@@ -197,11 +212,11 @@ char *ssh_exec(const Guest *g, const char *command)
 
     /* Build SSH options */
     char ssh_opts[1024];
-    build_ssh_opts(g, ssh_opts, sizeof(ssh_opts), 0);
+    ssh_build_opts(g, ssh_opts, sizeof(ssh_opts), 0);
 
     char cmd[4096];
     int n;
-    if (g->ssh_password[0] != '\0' && cmd_exists("sshpass")) {
+    if (g->ssh_password[0] != '\0' && have_sshpass()) {
         /* Password auth via sshpass */
         n = snprintf(cmd, sizeof(cmd),
             "sshpass -p '%s' ssh %s %s@%s \"%s\"",

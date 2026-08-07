@@ -26,4 +26,17 @@ int ssh_scp_to(const Guest *g, const char *local_path, const char *remote_path,
  */
 int ssh_ping(const Guest *g);
 
+/*
+ * Build the shared ssh/scp option string for a guest (host-key policy,
+ * timeouts, port, and -i when the guest has a usable key).
+ *
+ * Exported because shell.c was assembling its own, and had drifted: it still
+ * passed StrictHostKeyChecking=no with UserKnownHostsFile=/dev/null, the exact
+ * pair this file was changed away from, so the interactive shell accepted
+ * whatever answered on the address and kept no record of it.
+ *
+ * scp needs -P for the port; ssh needs -p. Pass for_scp accordingly.
+ */
+void ssh_build_opts(const Guest *g, char *opts, size_t sz, int for_scp);
+
 #endif

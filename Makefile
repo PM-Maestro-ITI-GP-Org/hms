@@ -31,7 +31,11 @@ MQTT_LIBDIR ?= /usr/local/lib
 # warning settings. The flags this code requires are kept out of it, so
 # overriding CFLAGS cannot drop them.
 CFLAGS     ?= -O2 -Wall -Wextra
-APP_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_ALL_SOURCE
+# -pthread, not just -lpthread: shell.c and ota.c create threads, and on a host
+# toolchain the flag is also what defines _REENTRANT. QNX carries pthreads in
+# libc, so this is a no-op there and correct anywhere else the sources are
+# compiled -- which is how they get checked without an SDP to hand.
+APP_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_ALL_SOURCE -pthread
 
 CPPFLAGS += -I$(MQTT_INCDIR)
 LDFLAGS  += -L$(MQTT_LIBDIR)
@@ -69,7 +73,7 @@ $(BUILD_DIR)/%.o: %.c
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
+	$(CC) -pthread -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
 
 # Copy hms and its configuration to a running host.
 # Usage: make deploy HOST=root@192.168.2.2

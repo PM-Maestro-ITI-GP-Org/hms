@@ -44,22 +44,107 @@ typedef struct {
     int (*start_guest)(const char *id);
 } ota_job_t;
 
+/*
+ * JSON-escape a string into out. Progress messages carry file names, tar and
+ * scp diagnostics and whole tails of ssh stderr -- all of which contain quotes,
+ * backslashes and newlines. Pasted into the payload raw they made it invalid
+ * JSON, so the GUI dropped exactly the messages that explained a failure.
+ */
+static void ota_escape(const char *in, char *out, size_t out_sz)
+{
+    size_t j = 0;
+    if (out_sz == 0) return;
+    for (size_t i = 0; in && in[i] && j + 8 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\')  { out[j++] = '\\'; out[j++] = (char)c; }
+        else if (c == '\n')         { out[j++] = '\\'; out[j++] = 'n'; }
+        else if (c == '\r')         { out[j++] = '\\'; out[j++] = 'r'; }
+        else if (c == '\t')         { out[j++] = '\\'; out[j++] = 't'; }
+        else if (c < 0x20)          { j += (size_t)snprintf(out + j, out_sz - j, "\\u%04x", c); }
+        else                        { out[j++] = (char)c; }
+    }
+    out[j] = '\0';
+}
+
+/*
+ * Wrap a string in single quotes for /bin/sh.
+ *
+ * The double quotes used around these paths do not stop `$(...)` or a
+ * backtick, and every one of these paths arrives in an MQTT payload -- so a
+ * crafted remote path was a command running as root on the host. Single quotes
+ * have no such escapes; the only thing to handle is a quote in the string
+ * itself, which ends the literal, inserts an escaped quote and reopens it.
+ */
+static void sh_quote(const char *in, char *out, size_t out_sz)
+{
+    size_t j = 0;
+    if (out_sz < 3) { if (out_sz) out[0] = '\0'; return; }
+    out[j++] = '\'';
+    for (size_t i = 0; in && in[i] && j + 5 < out_sz; i++) {
+        if (in[i] == '\'') {
+            out[j++] = '\''; out[j++] = '\\'; out[j++] = '\''; out[j++] = '\'';
+        } else {
+            out[j++] = in[i];
+        }
+    }
+    out[j++] = '\'';
+    out[j] = '\0';
+}
+
 static void ota_report(hms_mqtt_t *mqtt, const char *guest_id,
                        const char *stage, int progress, const char *msg)
 {
+    char esc[1024];
+    ota_escape(msg, esc, sizeof(esc));
+
     char buf[1536];
     snprintf(buf, sizeof(buf),
              "{\"state\":\"ota_progress\",\"guest\":\"%s\","
              "\"stage\":\"%s\",\"progress\":%d,\"msg\":\"%s\"}",
-             guest_id, stage, progress, msg);
+             guest_id, stage, progress, esc);
+    hms_mqtt_publish_status(mqtt, buf);
+}
+
+/* Publish {"state":"ota_result", ...} with the message escaped. */
+static void ota_publish_result(hms_mqtt_t *mqtt, const char *guest_id,
+                               int success, const char *msg)
+{
+    char esc[1024];
+    ota_escape(msg, esc, sizeof(esc));
+
+    char buf[1536];
+    snprintf(buf, sizeof(buf),
+             "{\"state\":\"ota_result\",\"guest\":\"%s\",\"success\":%s,"
+             "\"msg\":\"%s\"}",
+             guest_id, success ? "true" : "false", esc);
     hms_mqtt_publish_status(mqtt, buf);
 }
 
 static void msleep(long ms);
 
-/* Run a shell command and return its exit code. SIGCHLD is SIG_IGN so
- * children are auto-reaped and waitpid()/system() are unusable — capture
- * the exit code in a temp file instead. */
+/*
+ * Wait for a child that cannot be waited for.
+ *
+ * SIGCHLD is SIG_IGN process-wide (so the qvm children guest_start() forks are
+ * auto-reaped rather than piling up as zombies), which makes waitpid() fail
+ * with ECHILD for every child in the process -- these included. Polling
+ * kill(pid,0) is what is left. An auto-reaped pid is released immediately, so
+ * the poll is capped: past the cap the pid may already belong to something
+ * else and waiting on it would be waiting on a stranger.
+ */
+static void wait_for_child(pid_t pid, int timeout_s)
+{
+    for (int i = 0; i < timeout_s * 10; i++) {
+        if (kill(pid, 0) != 0)
+            return;
+        msleep(100);
+    }
+    fprintf(stderr, "[ota] child %d still alive after %ds — giving up on it\n",
+            (int)pid, timeout_s);
+}
+
+/* Run a shell command and return its exit code. See wait_for_child() for why
+ * the status comes back through a file rather than waitpid(). */
 static int run_cmd(const char *fmt, ...)
 {
     char cmd[8192];
@@ -70,26 +155,36 @@ static int run_cmd(const char *fmt, ...)
 
     printf("[ota] exec: %s\n", cmd);
 
+    /* The sequence number was a plain static++ read and written by every OTA
+       worker thread at once, so two concurrent jobs could pick the same file
+       name and each read back the other's exit code. The thread id makes the
+       name unique without needing the counter to be atomic. */
     static unsigned int seq = 0;
+    static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&seq_lock);
+    unsigned int mine = seq++;
+    pthread_mutex_unlock(&seq_lock);
+
     char rcfile[128];
-    snprintf(rcfile, sizeof(rcfile), "/tmp/ota_rc_%d_%u", getpid(), seq++);
+    snprintf(rcfile, sizeof(rcfile), "/tmp/ota_rc_%d_%u", (int)getpid(), mine);
+
+    char qrc[280];
+    sh_quote(rcfile, qrc, sizeof(qrc));
 
     char wrapped[9000];
-    snprintf(wrapped, sizeof(wrapped), "%s; echo $? > %s", cmd, rcfile);
+    snprintf(wrapped, sizeof(wrapped), "%s; echo $? > %s", cmd, qrc);
 
     pid_t pid = fork();
-    if (pid == 0) {
-        execl("/bin/sh", "sh", "-c", wrapped, (char *)NULL);
-        _exit(127);
-    }
     if (pid < 0) {
         fprintf(stderr, "[ota] fork failed: %s\n", strerror(errno));
         return -1;
     }
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", wrapped, (char *)NULL);
+        _exit(127);
+    }
 
-    /* Wait for the child to finish (auto-reaped; kill(pid,0) goes ESRCH). */
-    while (kill(pid, 0) == 0)
-        msleep(100);
+    wait_for_child(pid, 3600);
 
     int rc = -1;
     FILE *f = fopen(rcfile, "r");
@@ -111,27 +206,42 @@ static void msleep(long ms)
 
 static void mkdirs(const char *path)
 {
-    char tmp[3200];
-    snprintf(tmp, sizeof(tmp), "mkdir -p %s", path);
-    (void)run_cmd("%s", tmp);
+    char q[3200];
+    sh_quote(path, q, sizeof(q));
+    (void)run_cmd("mkdir -p %s", q);
+}
+
+/* ssh_key may be stored as '.ssh/id_ed25519', '/.ssh/id_ed25519' or
+ * '/root/.ssh/id_ed25519' — normalize to the root home directory. */
+static void resolve_key(const char *ssh_key, char *out, size_t out_sz)
+{
+    if (strncmp(ssh_key, "/root/", 6) == 0)
+        snprintf(out, out_sz, "%s", ssh_key);
+    else if (ssh_key[0] == '/')
+        snprintf(out, out_sz, "/root%s", ssh_key);
+    else
+        snprintf(out, out_sz, "/root/%s", ssh_key);
 }
 
 static long long remote_size(const char *server, const char *ssh_key,
                              const char *remote_path)
 {
     char resolved_key[1024];
-    /* ssh_key may be stored as '.ssh/id_ed25519', '/.ssh/id_ed25519' or
-     * '/root/.ssh/id_ed25519' — normalize to the root home directory. */
-    if (strncmp(ssh_key, "/root/", 6) == 0)
-        snprintf(resolved_key, sizeof(resolved_key), "%s", ssh_key);
-    else if (ssh_key[0] == '/')
-        snprintf(resolved_key, sizeof(resolved_key), "/root%s", ssh_key);
-    else
-        snprintf(resolved_key, sizeof(resolved_key), "/root/%s", ssh_key);
-    char cmd[4096];
+    resolve_key(ssh_key, resolved_key, sizeof(resolved_key));
+
+    char qkey[2100], qsrv[560], qpath[2100];
+    sh_quote(resolved_key, qkey, sizeof(qkey));
+    sh_quote(server, qsrv, sizeof(qsrv));
+    /* Quoted twice on purpose: once for the local shell popen() runs, and
+       once more so the remote shell sshd starts sees a single argument. */
+    sh_quote(remote_path, qpath, sizeof(qpath));
+    char qqpath[4200];
+    sh_quote(qpath, qqpath, sizeof(qqpath));
+
+    char cmd[9000];
     snprintf(cmd, sizeof(cmd),
-             "ssh " SCP_COMMON_OPTS " -i %s %s stat -c %%s \"%s\" 2>/dev/null",
-             resolved_key, server, remote_path);
+             "ssh " SCP_COMMON_OPTS " -i %s %s stat -c %%s %s 2>/dev/null",
+             qkey, qsrv, qqpath);
     FILE *fp = popen(cmd, "r");
     if (!fp) return -1;
     char buf[64];
@@ -141,16 +251,26 @@ static long long remote_size(const char *server, const char *ssh_key,
     return sz > 0 ? sz : -1;
 }
 
+/* The tar flag this archive needs, or NULL if it is not an archive.
+ * "xzf" was used for everything except a plain .tar, so a .tar.bz2 was fed to
+ * gunzip and a .xz was not recognised at all. */
+static const char *archive_tar_opt(const char *path)
+{
+    if (strstr(path, ".tar.gz")  || strstr(path, ".tgz"))  return "xzf";
+    if (strstr(path, ".tar.bz2") || strstr(path, ".tbz2")) return "xjf";
+    if (strstr(path, ".tar.xz")  || strstr(path, ".txz"))  return "xJf";
+    const char *ext = strrchr(path, '.');
+    if (!ext) return NULL;
+    if (strcmp(ext, ".gz")  == 0) return "xzf";
+    if (strcmp(ext, ".bz2") == 0) return "xjf";
+    if (strcmp(ext, ".xz")  == 0) return "xJf";
+    if (strcmp(ext, ".tar") == 0) return "xf";
+    return NULL;
+}
+
 static int is_archive(const char *path)
 {
-    const char *ext = strrchr(path, '.');
-    if (!ext) return 0;
-    if (strcmp(ext, ".tar") == 0 || strcmp(ext, ".gz") == 0 ||
-        strcmp(ext, ".tgz") == 0 || strcmp(ext, ".bz2") == 0 ||
-        strcmp(ext, ".xz") == 0) return 1;
-    if (strstr(path, ".tar.gz") || strstr(path, ".tar.bz2"))
-        return 1;
-    return 0;
+    return archive_tar_opt(path) != NULL;
 }
 
 /*
@@ -161,19 +281,29 @@ static int ota_download(const ota_job_t *j, const char *local_file,
                         long long remote_sz)
 {
     char resolved_key[1024];
-    /* Normalize key path to root home (see remote_size above). */
-    if (strncmp(j->ssh_key, "/root/", 6) == 0)
-        snprintf(resolved_key, sizeof(resolved_key), "%s", j->ssh_key);
-    else if (j->ssh_key[0] == '/')
-        snprintf(resolved_key, sizeof(resolved_key), "/root%s", j->ssh_key);
-    else
-        snprintf(resolved_key, sizeof(resolved_key), "/root/%s", j->ssh_key);
-    char scp_cmd[4096];
+    resolve_key(j->ssh_key, resolved_key, sizeof(resolved_key));
+
+    char qkey[2100], qspec[4200], qlocal[2100];
+    char spec[1400];
+    snprintf(spec, sizeof(spec), "%s:%s", j->server, j->remote_path);
+    sh_quote(resolved_key, qkey, sizeof(qkey));
+    sh_quote(spec, qspec, sizeof(qspec));
+    sh_quote(local_file, qlocal, sizeof(qlocal));
+
+    char scp_cmd[9000];
     snprintf(scp_cmd, sizeof(scp_cmd),
-             "scp -C " SCP_COMMON_OPTS " -i %s \"%s:%s\" \"%s\"",
-             resolved_key, j->server, j->remote_path, local_file);
+             "scp -C " SCP_COMMON_OPTS " -i %s %s %s",
+             qkey, qspec, qlocal);
 
     pid_t pid = fork();
+    /* fork() failure went unchecked, and the loop below then called
+       kill(-1, 0) -- which asks about *every* process this one may signal,
+       succeeds, and so never terminates. A failed fork hung the OTA thread
+       forever instead of reporting a failure. */
+    if (pid < 0) {
+        fprintf(stderr, "[ota] fork failed: %s\n", strerror(errno));
+        return -1;
+    }
     if (pid == 0) {
         execl("/bin/sh", "sh", "-c", scp_cmd, (char *)NULL);
         _exit(127);
@@ -227,21 +357,28 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
 {
     char stage[GUEST_PATH_LEN + 1100];
     snprintf(stage, sizeof(stage), "%s/%s/stage", OTA_STAGE_DIR, j->guest_id);
-    mkdirs(stage);
+
+    char qstage[3200], qpkg[3200], qdir[600];
+    sh_quote(stage, qstage, sizeof(qstage));
+    sh_quote(pkg, qpkg, sizeof(qpkg));
+    sh_quote(guest_dir, qdir, sizeof(qdir));
 
     if (is_archive(pkg)) {
+        /* Start from an empty stage: leftovers from an earlier package would
+           otherwise be copied into the guest alongside this one's files. */
+        (void)run_cmd("rm -rf %s", qstage);
+        mkdirs(stage);
+
         ota_report(j->mqtt, j->guest_id, "extract", 0, "Extracting package");
-        const char *taropt = "xzf";
-        if (strstr(pkg, ".tar") && !strstr(pkg, ".gz"))
-            taropt = "xf";
-        int rc = run_cmd("tar -%s -C %s -f %s", taropt, stage, pkg);
+        int rc = run_cmd("tar -%s %s -C %s", archive_tar_opt(pkg), qpkg, qstage);
         if (rc != 0) {
             ota_report(j->mqtt, j->guest_id, "extract", 0, "Extraction failed");
             return -1;
         }
 
         /* If the archive contains a single top-level directory, use it as payload root */
-        snprintf(payload_out, payload_sz, "%s", stage);
+        char payload[GUEST_PATH_LEN + 1400];
+        snprintf(payload, sizeof(payload), "%s", stage);
         DIR *d = opendir(stage);
         if (d) {
             char only[GUEST_PATH_LEN + 1400] = "";
@@ -256,20 +393,48 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
             if (count == 1) {
                 struct stat st;
                 if (stat(only, &st) == 0 && S_ISDIR(st.st_mode))
-                    snprintf(payload_out, payload_sz, "%s", only);
+                    snprintf(payload, sizeof(payload), "%s", only);
             }
         }
-    } else {
-        ota_report(j->mqtt, j->guest_id, "extract", 0, "Copying file into guest directory");
-        char dst[GUEST_PATH_LEN + 1400];
-        const char *name = strrchr(pkg, '/');
-        name = name ? name + 1 : pkg;
-        snprintf(dst, sizeof(dst), "%s/%s", guest_dir, name);
-        snprintf(payload_out, payload_sz, "%s", dst);
-        return run_cmd("cp -f \"%s\" \"%s\"", pkg, dst);
+        snprintf(payload_out, payload_sz, "%s", payload);
+
+        /*
+         * Install it. This is the step that was missing: the archive was
+         * unpacked into /tmp, the payload root was worked out and written to
+         * payload_out -- and the caller never used it. Nothing was ever copied
+         * into /guests/<id>, so an archive OTA reported "Update applied",
+         * restarted the guest, and left it running exactly the image it had
+         * before. Only the plain-file branch below ever wrote to the guest.
+         */
+        ota_report(j->mqtt, j->guest_id, "apply", 50,
+                   "Installing files into the guest directory");
+
+        char qpayload[3200];
+        sh_quote(payload, qpayload, sizeof(qpayload));
+
+        /* The trailing /. copies the *contents* of the payload root, so the
+           guest directory is updated in place rather than gaining a nested
+           copy of the archive's top-level folder. */
+        rc = run_cmd("cp -rf %s/. %s/", qpayload, qdir);
+        if (rc != 0) {
+            ota_report(j->mqtt, j->guest_id, "apply", 0,
+                       "Failed to copy the package into the guest directory");
+            return -1;
+        }
+        (void)run_cmd("rm -rf %s", qstage);
+        return 0;
     }
 
-    return 0;
+    ota_report(j->mqtt, j->guest_id, "extract", 0, "Copying file into guest directory");
+    char dst[GUEST_PATH_LEN + 1400];
+    const char *name = strrchr(pkg, '/');
+    name = name ? name + 1 : pkg;
+    snprintf(dst, sizeof(dst), "%s/%s", guest_dir, name);
+    snprintf(payload_out, payload_sz, "%s", dst);
+
+    char qdst[3200];
+    sh_quote(dst, qdst, sizeof(qdst));
+    return run_cmd("cp -f %s %s", qpkg, qdst);
 }
 
 static void *ota_thread(void *arg)
@@ -311,18 +476,17 @@ static void *ota_thread(void *arg)
     ota_report(j->mqtt, j->guest_id, "restart", 0, "Restarting guest");
     int ok = (j->start_guest && j->start_guest(j->guest_id) == 0);
 
-    {
-        char buf[1536];
-        snprintf(buf, sizeof(buf),
-                 "{\"state\":\"ota_result\",\"guest\":\"%s\",\"success\":%s,"
-                 "\"msg\":\"%s\"}",
-                 j->guest_id, ok ? "true" : "false",
-                 ok ? "OTA update applied and guest restarted"
-                    : "Update applied but guest restart failed");
-        hms_mqtt_publish_status(j->mqtt, buf);
-    }
+    ota_publish_result(j->mqtt, j->guest_id, ok,
+                       ok ? "OTA update applied and guest restarted"
+                          : "Update applied but guest restart failed");
+    free(j);
+    return NULL;
 
 done:
+    /* Every failure path jumped here and returned without ever publishing an
+       ota_result, so the GUI sat on "deploying" until its watchdog fired with
+       no reason given. */
+    ota_publish_result(j->mqtt, j->guest_id, 0, "OTA update failed");
     free(j);
     return NULL;
 }
@@ -405,19 +569,27 @@ static int pull_file(const char *server, const char *ssh_key,
                      int file_idx, int n_files)
 {
     char resolved_key[1024];
-    /* Normalize key path to root home (see remote_size above). */
-    if (strncmp(ssh_key, "/root/", 6) == 0)
-        snprintf(resolved_key, sizeof(resolved_key), "%s", ssh_key);
-    else if (ssh_key[0] == '/')
-        snprintf(resolved_key, sizeof(resolved_key), "/root%s", ssh_key);
-    else
-        snprintf(resolved_key, sizeof(resolved_key), "/root/%s", ssh_key);
-    char cmd[4096];
+    resolve_key(ssh_key, resolved_key, sizeof(resolved_key));
+
+    char qkey[2100], qspec[4200], qlocal[2100];
+    char spec[1400];
+    snprintf(spec, sizeof(spec), "%s:%s", server, remote);
+    sh_quote(resolved_key, qkey, sizeof(qkey));
+    sh_quote(spec, qspec, sizeof(qspec));
+    sh_quote(local_file, qlocal, sizeof(qlocal));
+
+    char cmd[9000];
     snprintf(cmd, sizeof(cmd),
-             "scp -C " SCP_COMMON_OPTS " -i %s \"%s:%s\" \"%s\"",
-             resolved_key, server, remote, local_file);
+             "scp -C " SCP_COMMON_OPTS " -i %s %s %s",
+             qkey, qspec, qlocal);
 
     pid_t pid = fork();
+    /* Unchecked fork() here too: pid -1 turned the poll below into
+       kill(-1, 0), which never fails, and hung the job. */
+    if (pid < 0) {
+        fprintf(stderr, "[ota] fork failed: %s\n", strerror(errno));
+        return -1;
+    }
     if (pid == 0) {
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
@@ -471,6 +643,18 @@ static void *ota_fetch_thread(void *arg)
     ota_apply_job_t *j = (ota_apply_job_t *)arg;
     int i;
 
+    /*
+     * Empty the stage dir first. Only the files named in *this* fetch were
+     * removed before transfer, so anything left from an earlier fetch stayed
+     * behind -- and ota_apply_thread() applies whatever it finds in the
+     * directory, not what was asked for. A file the user had staged and then
+     * removed from the list was still installed on the next Apply.
+     */
+    {
+        char q[3200];
+        sh_quote(j->stage_dir, q, sizeof(q));
+        (void)run_cmd("rm -rf %s", q);
+    }
     mkdirs(j->stage_dir);
 
     for (i = 0; i < j->n_paths; i++) {
@@ -506,22 +690,25 @@ static void *ota_fetch_thread(void *arg)
                 ok = 1;
         }
         if (!ok) {
-        ota_report(j->mqtt, j->guest_id, "failed", 0, "Failed to pull file from server after 3 attempts");
+            ota_report(j->mqtt, j->guest_id, "failed", 0,
+                       "Failed to pull file from server after 3 attempts");
             goto done;
         }
         ota_report(j->mqtt, j->guest_id, "download", 100, "Fetched file from server");
     }
 
     {
-        char buf[1536];
-        snprintf(buf, sizeof(buf),
-                 "{\"state\":\"ota_result\",\"guest\":\"%s\",\"success\":true,"
-                 "\"msg\":\"%d file(s) fetched, ready to apply\"}",
-                 j->guest_id, j->n_paths);
-        hms_mqtt_publish_status(j->mqtt, buf);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%d file(s) fetched, ready to apply", j->n_paths);
+        ota_publish_result(j->mqtt, j->guest_id, 1, msg);
     }
+    free(j);
+    return NULL;
 
 done:
+    /* As in ota_thread(): the failure paths returned silently and left the GUI
+       waiting on a result that never came. */
+    ota_publish_result(j->mqtt, j->guest_id, 0, "fetch failed");
     free(j);
     return NULL;
 }
@@ -577,7 +764,10 @@ static void *ota_apply_thread(void *arg)
         snprintf(dest, sizeof(dest), "%s/%s", j->dest_dir, names[i]);
         snprintf(local_stage, sizeof(local_stage), "%s/%s", j->stage_dir, names[i]);
 
-        if (run_cmd("cp -f \"%s\" \"%s\"", local_stage, dest) != 0) {
+        char qsrc[3200], qdest[3200];
+        sh_quote(local_stage, qsrc, sizeof(qsrc));
+        sh_quote(dest, qdest, sizeof(qdest));
+        if (run_cmd("cp -f %s %s", qsrc, qdest) != 0) {
             ota_report(j->mqtt, j->guest_id, "failed", 0,
                        "Failed to place file in guest directory");
             goto done;
@@ -611,16 +801,16 @@ static void *ota_apply_thread(void *arg)
     }
 
     {
-        char buf[1536];
-        snprintf(buf, sizeof(buf),
-                 "{\"state\":\"ota_result\",\"guest\":\"%s\",\"success\":true,"
-                 "\"msg\":\"%d file(s) applied%s\"}",
-                 j->guest_id, n,
+        char msg[160];
+        snprintf(msg, sizeof(msg), "%d file(s) applied%s", n,
                  restart ? " and guest restarted" : " (no restart)");
-        hms_mqtt_publish_status(j->mqtt, buf);
+        ota_publish_result(j->mqtt, j->guest_id, 1, msg);
     }
+    free(j);
+    return NULL;
 
 done:
+    ota_publish_result(j->mqtt, j->guest_id, 0, "apply failed");
     free(j);
     return NULL;
 }
@@ -721,6 +911,8 @@ static void *ota_push_thread(void *arg)
     if (remote_sz <= 0) {
         ota_report(j->mqtt, j->guest_id, "failed", 0,
                    "Archive not found on the server");
+        ota_publish_result(j->mqtt, j->guest_id, 0,
+                           "archive not found on the server");
         free(j);
         return NULL;
     }
@@ -741,6 +933,8 @@ static void *ota_push_thread(void *arg)
     if (!ok) {
         ota_report(j->mqtt, j->guest_id, "failed", 0,
                    "Failed to pull the archive after 3 attempts");
+        ota_publish_result(j->mqtt, j->guest_id, 0,
+                           "failed to pull the archive from the server");
         free(j);
         return NULL;
     }
@@ -754,6 +948,7 @@ static void *ota_push_thread(void *arg)
         snprintf(msg, sizeof(msg), "Failed to copy the archive into the guest: %s",
                  push_err[0] ? push_err : "unknown error");
         ota_report(j->mqtt, j->guest_id, "failed", 0, msg);
+        ota_publish_result(j->mqtt, j->guest_id, 0, msg);
         remove(local_tar);
         free(j);
         return NULL;
@@ -781,20 +976,19 @@ static void *ota_push_thread(void *arg)
     free(out);
     remove(local_tar);
 
-    char buf[1600];
     if (success) {
-        snprintf(buf, sizeof(buf),
-                 "{\"state\":\"ota_result\",\"guest\":\"%s\",\"success\":true,"
-                 "\"msg\":\"files pushed to guest\"}",
-                 j->guest_id);
         ota_report(j->mqtt, j->guest_id, "pushfiles", 100, "Files pushed to guest");
+        ota_publish_result(j->mqtt, j->guest_id, 1, "files pushed to guest");
     } else {
-        snprintf(buf, sizeof(buf),
-                 "{\"state\":\"ota_result\",\"guest\":\"%s\",\"success\":false,"
-                 "\"msg\":\"extraction failed inside the guest: %s\"}",
-                 j->guest_id, extract_err[0] ? extract_err : "unknown error");
+        /* extract_err is a raw tail of the guest's stderr. It went into the
+           payload unescaped, so a tar error mentioning a path in quotes -- the
+           normal shape of a tar error -- produced JSON the GUI could not
+           parse and the failure was never shown. */
+        char msg[900];
+        snprintf(msg, sizeof(msg), "extraction failed inside the guest: %s",
+                 extract_err[0] ? extract_err : "unknown error");
+        ota_publish_result(j->mqtt, j->guest_id, 0, msg);
     }
-    hms_mqtt_publish_status(j->mqtt, buf);
     free(j);
     return NULL;
 }
@@ -835,11 +1029,14 @@ typedef struct {
 
 static void publish_addfile_result(addfile_job_t *j, int success, const char *msg)
 {
+    char esc[1024];
+    ota_escape(msg, esc, sizeof(esc));
+
     char buf[1536];
     snprintf(buf, sizeof(buf),
              "{\"state\":\"addfile_result\",\"guest\":\"%s\",\"success\":%s,"
              "\"msg\":\"%s\"}",
-             j->guest_id, success ? "true" : "false", msg);
+             j->guest_id, success ? "true" : "false", esc);
     hms_mqtt_publish_status(j->mqtt, buf);
 }
 
@@ -870,7 +1067,12 @@ static void *addfile_thread(void *arg)
     int ok = (pull_file(j->server, j->ssh_key, j->remote_path, local, remote_sz,
                         j->guest_id, j->mqtt, "addfile", 0, 1) == 0);
     if (ok) {
-        ok = (run_cmd("cp -f \"%s\" \"%s/%s\"", local, guest_dir, name) == 0);
+        char dest[GUEST_PATH_LEN + 300];
+        snprintf(dest, sizeof(dest), "%s/%s", guest_dir, name);
+        char qsrc[4200], qdest[1400];
+        sh_quote(local, qsrc, sizeof(qsrc));
+        sh_quote(dest, qdest, sizeof(qdest));
+        ok = (run_cmd("cp -f %s %s", qsrc, qdest) == 0);
         remove(local);
     }
 
@@ -925,11 +1127,14 @@ typedef struct {
 
 static void publish_addguest_result(addguest_job_t *j, int success, const char *msg)
 {
+    char esc[1024];
+    ota_escape(msg, esc, sizeof(esc));
+
     char buf[1536];
     snprintf(buf, sizeof(buf),
              "{\"state\":\"addguest_result\",\"guest\":\"%s\",\"success\":%s,"
              "\"msg\":\"%s\"}",
-             j->guest_id, success ? "true" : "false", msg);
+             j->guest_id, success ? "true" : "false", esc);
     hms_mqtt_publish_status(j->mqtt, buf);
 }
 
@@ -985,7 +1190,15 @@ static void *addguest_thread(void *arg)
                  j->guest_id, conf_name, ifs_name);
         publish_addguest_result(j, 1, msg);
     } else {
-        publish_addguest_result(j, 0, "failed to pull the guest files from the server");
+        /* The directory was created before the transfers and left behind when
+           they failed, so the retry hit the "a guest with this ID already
+           exists" check above and the id could never be used again -- while
+           the half-made guest sat in /guests being discovered. */
+        char q[600];
+        sh_quote(guest_dir, q, sizeof(q));
+        (void)run_cmd("rm -rf %s", q);
+        publish_addguest_result(j, 0,
+            "failed to pull the guest files from the server (directory removed)");
     }
 
 done:

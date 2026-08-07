@@ -22,6 +22,22 @@ const char *guest_state_str(GuestState s) {
     }
 }
 
+int guest_id_is_valid(const char *id)
+{
+    if (!id || !id[0]) return 0;
+    if (id[0] == '.') return 0;
+    if (strstr(id, "..")) return 0;
+    if (strlen(id) >= GUEST_ID_LEN) return 0;
+
+    for (const char *p = id; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
 GuestType guest_type_from_conf(const char *conf_path) {
     FILE *f = fopen(conf_path, "r");
     if (!f) return GUEST_UNKNOWN;

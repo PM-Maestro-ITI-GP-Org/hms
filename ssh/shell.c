@@ -9,6 +9,7 @@
  * MQTT command loop is never blocked.
  */
 #include "shell.h"
+#include "client.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,12 +165,27 @@ int shell_open(hms_mqtt_t *mqtt, const Guest *g,
     }
     pthread_mutex_unlock(&s_lock);
 
-    char sshcmd[1024];
+    /*
+     * ssh_build_opts() supplies the host-key policy, the timeout, the port and
+     * -i only when the guest actually has a key file.
+     *
+     * The hand-rolled string this replaces got both halves wrong. It passed
+     * StrictHostKeyChecking=no together with UserKnownHostsFile=/dev/null --
+     * the pair client.c was deliberately moved away from, which accepts
+     * whatever answers on the address and keeps no record to compare next
+     * time. And it always passed "-i %s": for a guest authenticating by
+     * password, ssh_key is empty, so the option became a bare "-i" that
+     * swallowed the following "user@host" as its filename argument and left
+     * ssh with no destination at all. Opening a shell on such a guest could
+     * not work.
+     */
+    char ssh_opts[1024];
+    ssh_build_opts(g, ssh_opts, sizeof(ssh_opts), 0);
+
+    char sshcmd[2048];
     snprintf(sshcmd, sizeof(sshcmd),
-             "ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-             "-o LogLevel=ERROR -o ConnectTimeout=5 -o ServerAliveInterval=10 "
-             "-o ServerAliveCountMax=60 -p %d -i %s %s@%s",
-             g->ssh_port, g->ssh_key, g->ssh_user, g->ip);
+             "ssh -T %s -o ServerAliveInterval=10 -o ServerAliveCountMax=60 %s@%s",
+             ssh_opts, g->ssh_user, g->ip);
 
     int in_pipe[2], out_pipe[2];
     if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0) {
@@ -251,38 +267,63 @@ int shell_open(hms_mqtt_t *mqtt, const Guest *g,
 int shell_write(const char *guest_id, const char *data,
                 char *errbuf, size_t errbuf_sz)
 {
+    /*
+     * Take the fd under the lock, then write outside it.
+     *
+     * The write used to happen with s_lock held. write() to a pipe blocks once
+     * the pipe fills, which is what happens whenever the guest stops draining
+     * its stdin -- and holding the global lock through that froze every other
+     * shell operation in the process, including the idle monitor that exists
+     * to clean up exactly this situation. One wedged guest took the whole
+     * shell subsystem with it.
+     *
+     * The fd may be closed by shell_close() while we are writing; that turns
+     * the write into EBADF or EPIPE, which is reported like any other write
+     * failure. SIGPIPE is ignored in main().
+     */
+    int fd = -1;
+    int slot = -1;
     pthread_mutex_lock(&s_lock);
-    ShellSession *s = NULL;
     for (int i = 0; i < SHELL_MAX_SESSIONS; i++) {
         if (s_sessions[i].alive && strcmp(s_sessions[i].guest_id, guest_id) == 0) {
-            s = &s_sessions[i];
+            fd = s_sessions[i].in_fd;
+            slot = i;
             break;
         }
     }
-    if (!s) {
-        pthread_mutex_unlock(&s_lock);
+    pthread_mutex_unlock(&s_lock);
+
+    if (slot < 0 || fd < 0) {
         snprintf(errbuf, errbuf_sz, "no open shell for this guest");
         return -1;
     }
 
     size_t len = strlen(data);
     size_t off = 0;
-    int rc = 0;
+    int rc = 0, saved_errno = 0;
     while (off < len) {
-        ssize_t w = write(s->in_fd, data + off, len - off);
+        ssize_t w = write(fd, data + off, len - off);
         if (w < 0) {
             if (errno == EINTR) continue;
+            saved_errno = errno;
             rc = -1;
             break;
         }
         off += (size_t)w;
     }
-    if (rc == 0)
-        s->last_activity = time(NULL);
-    pthread_mutex_unlock(&s_lock);
 
-    if (rc != 0)
-        snprintf(errbuf, errbuf_sz, "write to shell failed: %s", strerror(errno));
+    if (rc == 0) {
+        pthread_mutex_lock(&s_lock);
+        /* Re-check the slot still belongs to this guest: the reader thread may
+           have released it while the write was in flight. */
+        if (s_sessions[slot].alive &&
+            strcmp(s_sessions[slot].guest_id, guest_id) == 0)
+            s_sessions[slot].last_activity = time(NULL);
+        pthread_mutex_unlock(&s_lock);
+    } else {
+        snprintf(errbuf, errbuf_sz, "write to shell failed: %s",
+                 strerror(saved_errno));
+    }
     return rc;
 }
 

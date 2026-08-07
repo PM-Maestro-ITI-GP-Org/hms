@@ -9,80 +9,178 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/stat.h>
 
-static Guest      guests[MAX_GUESTS];
-static int        guest_count = 0;
-static HmsConfig  cfg;
-static hms_mqtt_t mqtt;
+/*
+ * `guests` is written by the refresh loop on the main thread and read by every
+ * command handler, which runs on libmosquitto's network thread -- plus by the
+ * OTA worker threads through the kill/start callbacks. It was shared with no
+ * synchronisation at all: a "kill" arriving while refresh() was rebuilding the
+ * array read a half-written Guest, and a Guest* handed to a handler could be
+ * overwritten under it mid-command.
+ *
+ * The lock is only ever held around the array itself. refresh() does its slow
+ * work (a /proc scan, and an SSH per guest for the hostname, each with a 5 s
+ * connect timeout) into a local array and swaps it in under the lock, and
+ * handlers copy the Guest they need out and release before doing anything with
+ * it. Holding the lock across any of that would make one unreachable guest
+ * stall every command for the length of its SSH timeout.
+ */
+static Guest           guests[MAX_GUESTS];
+static int             guest_count = 0;
+static pthread_mutex_t guests_lock = PTHREAD_MUTEX_INITIALIZER;
+static HmsConfig       cfg;
+static hms_mqtt_t      mqtt;
+static volatile sig_atomic_t running = 1;
 
 static void apply_defaults(Guest *g)
 {
     if (g->ssh_port <= 0) g->ssh_port = cfg.ssh_default_port;
     if (g->ssh_user[0] == '\0')
-        strncpy(g->ssh_user, cfg.ssh_default_user, sizeof(g->ssh_user));
+        snprintf(g->ssh_user, sizeof(g->ssh_user), "%s", cfg.ssh_default_user);
     if (g->ssh_password[0] == '\0' && cfg.ssh_default_password[0] != '\0')
-        strncpy(g->ssh_password, cfg.ssh_default_password, sizeof(g->ssh_password));
+        snprintf(g->ssh_password, sizeof(g->ssh_password), "%s", cfg.ssh_default_password);
     if (g->ssh_key[0] == '\0' && cfg.ssh_key_path[0] != '\0')
-        strncpy(g->ssh_key, cfg.ssh_key_path, sizeof(g->ssh_key));
+        snprintf(g->ssh_key, sizeof(g->ssh_key), "%s", cfg.ssh_key_path);
 }
 
 static void refresh(void)
 {
-    guest_count = discover_guests(guests);
-    for (int i = 0; i < guest_count; i++) {
-        apply_defaults(&guests[i]);
-        refresh_guest_name(&guests[i]);
+    Guest scratch[MAX_GUESTS];
+    int n = discover_guests(scratch);
+    for (int i = 0; i < n; i++) {
+        apply_defaults(&scratch[i]);
+        refresh_guest_name(&scratch[i]);
     }
+
+    pthread_mutex_lock(&guests_lock);
+    if (n > 0)
+        memcpy(guests, scratch, (size_t)n * sizeof(Guest));
+    guest_count = n;
+    pthread_mutex_unlock(&guests_lock);
 }
 
-static Guest *find_guest_or_publish(const char *id)
+/* Copy the named guest out of the shared array. Returns 1 on success. */
+static int get_guest(const char *id, Guest *out)
 {
+    int found = 0;
+    pthread_mutex_lock(&guests_lock);
     Guest *g = find_guest(guests, guest_count, id);
-    if (!g) {
-        char buf[512];
-        snprintf(buf, sizeof(buf),
-                 "{\"state\":\"result\",\"cmd\":\"%s\",\"guest\":\"%s\","
-                 "\"success\":false,\"msg\":\"unknown guest '%s'\"}",
-                 "command", id, id);
-        hms_mqtt_publish_status(&mqtt, buf);
-    }
-    return g;
+    if (g) { *out = *g; found = 1; }
+    pthread_mutex_unlock(&guests_lock);
+    return found;
 }
+
+/*
+ * Record a state transition an operation has just made, so the next command
+ * does not act on the previous state in the window before refresh() runs.
+ */
+static void set_guest_state(const char *id, GuestState state, int pid)
+{
+    pthread_mutex_lock(&guests_lock);
+    Guest *g = find_guest(guests, guest_count, id);
+    if (g) { g->state = state; g->pid = pid; }
+    pthread_mutex_unlock(&guests_lock);
+}
+
+static int escape_json(const char *in, char *out, size_t out_sz);
 
 static void publish_result(const char *cmd, const char *guest_id,
                            int success, const char *msg)
 {
-    char buf[1024];
+    /* msg carries ssh/tar/scp output and file names, which routinely contain
+       quotes, backslashes and newlines. Pasted in raw they produced a payload
+       the GUI's JSON.parse() rejected, so the one message that would have said
+       what went wrong was the one message that never arrived. */
+    char esc[1024];
+    escape_json(msg ? msg : "", esc, sizeof(esc));
+
+    char buf[1400];
     snprintf(buf, sizeof(buf),
              "{\"state\":\"result\",\"cmd\":\"%s\",\"guest\":\"%s\","
              "\"success\":%s,\"msg\":\"%s\"}",
-             cmd, guest_id ? guest_id : "", success ? "true" : "false", msg);
+             cmd, guest_id ? guest_id : "", success ? "true" : "false", esc);
     hms_mqtt_publish_status(&mqtt, buf);
+}
+
+/*
+ * Look up a guest for a command, publishing the "unknown guest" result when it
+ * is not there. Returns 1 and fills `out` on success.
+ */
+static int find_guest_or_publish(const char *cmd, const char *id, Guest *out)
+{
+    if (get_guest(id, out))
+        return 1;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "unknown guest '%.64s'", id ? id : "");
+    publish_result(cmd, id, 0, msg);
+    return 0;
+}
+
+/*
+ * Append to a JSON buffer without ever running off the end.
+ *
+ * snprintf() returns the length it *would* have written, so the `pos +=
+ * snprintf(...)` this file used everywhere could leave pos past the end of the
+ * buffer -- and the next call's `sizeof(buf) - pos` then underflowed to an
+ * enormous size_t, turning a truncated message into a heap overflow. Returns 0
+ * when the text did not fit, so callers can stop early.
+ */
+static int json_append(char *buf, size_t sz, int *pos, const char *fmt, ...)
+{
+    if (*pos < 0 || (size_t)*pos >= sz)
+        return 0;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, sz - (size_t)*pos, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) return 0;
+    if ((size_t)n >= sz - (size_t)*pos) {
+        buf[sz - 1] = '\0';          /* leave the buffer terminated */
+        *pos = (int)sz;
+        return 0;
+    }
+    *pos += n;
+    return 1;
 }
 
 static void publish_guest_list(void)
 {
     char buf[8192];
-    int pos = snprintf(buf, sizeof(buf), "{\"state\":\"guest_list\",\"guests\":[");
-    for (int i = 0; i < guest_count && pos < (int)sizeof(buf) - 256; i++) {
+    int pos = 0;
+
+    pthread_mutex_lock(&guests_lock);
+    json_append(buf, sizeof(buf), &pos, "{\"state\":\"guest_list\",\"guests\":[");
+    for (int i = 0; i < guest_count; i++) {
         Guest *g = &guests[i];
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        "%s{\"id\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"state\":\"%s\","
-                        "\"pid\":%d,\"ip\":\"%s\"}",
-                        i ? "," : "",
-                        g->id,
-                        g->name[0] ? g->name : "-",
-                        guest_type_str(g->type),
-                        guest_state_str(g->state),
-                        g->pid,
-                        g->ip[0] ? g->ip : "-");
+        if (!json_append(buf, sizeof(buf), &pos,
+                         "%s{\"id\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"state\":\"%s\","
+                         "\"pid\":%d,\"ip\":\"%s\"}",
+                         i ? "," : "",
+                         g->id,
+                         g->name[0] ? g->name : "-",
+                         guest_type_str(g->type),
+                         guest_state_str(g->state),
+                         g->pid,
+                         g->ip[0] ? g->ip : "-"))
+            break;
     }
-    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    pthread_mutex_unlock(&guests_lock);
+
+    /* Always close the array, even if a guest had to be dropped: a truncated
+       payload is not JSON and the GUI drops the whole list rather than showing
+       the guests that did fit. */
+    if ((size_t)pos > sizeof(buf) - 3)
+        pos = (int)sizeof(buf) - 3;
+    snprintf(buf + pos, sizeof(buf) - (size_t)pos, "]}");
     hms_mqtt_publish_status(&mqtt, buf);
 }
 
@@ -125,14 +223,14 @@ static void cmd_list(void)
 
 static void cmd_start(const char *id, const char *ip)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("start", id, &g)) return;
 
     if (ip && ip[0] != '\0') {
-        snprintf(g->ip, sizeof(g->ip), "%s", ip);
-        guest_set_ip(g);
+        snprintf(g.ip, sizeof(g.ip), "%s", ip);
+        guest_set_ip(&g);
     }
-    int rc = guest_start(g);
+    int rc = guest_start(&g);
     refresh();
     publish_result("start", id, rc == 0,
                    rc == 0 ? "guest started" : "failed to start guest");
@@ -141,10 +239,10 @@ static void cmd_start(const char *id, const char *ip)
 
 static void cmd_kill(const char *id)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("kill", id, &g)) return;
 
-    int rc = guest_kill(g);
+    int rc = guest_kill(&g);
     refresh();
     publish_result("kill", id, rc == 0,
                    rc == 0 ? "guest killed" : "failed to kill guest");
@@ -153,10 +251,15 @@ static void cmd_kill(const char *id)
 
 static void cmd_info(const char *id)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    /* Refresh first, then look the guest up. The old order took the pointer,
+       then called refresh() -- which rebuilds the array from scratch -- and
+       then read through the pointer, so the details published belonged to
+       whichever guest had landed at that index. */
     refresh();
-    publish_guest_info(g);
+
+    Guest g;
+    if (!find_guest_or_publish("info", id, &g)) return;
+    publish_guest_info(&g);
 }
 
 /*
@@ -183,19 +286,23 @@ static int escape_json(const char *in, char *out, size_t out_sz)
 
 static void cmd_exec(const char *id, const char *command)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("exec", id, &g)) return;
 
-    if (g->state != GUEST_RUNNING) {
+    if (g.state != GUEST_RUNNING) {
         publish_result("exec", id, 0, "guest is not running");
         return;
     }
 
-    char *out = ssh_exec(g, command);
-    if (!out) out = "(no output / SSH failed)";
+    /* `out` was reassigned to a string literal when ssh_exec() returned NULL
+       and then free()d unconditionally at the end -- so every failed exec,
+       which is exactly when a guest is unreachable, freed a pointer into
+       read-only memory and took HMS down with it. */
+    char *out = ssh_exec(&g, command);
+    const char *text = out ? out : "(no output / SSH failed)";
 
     char escaped[4096];
-    escape_json(out, escaped, sizeof(escaped));
+    escape_json(text, escaped, sizeof(escaped));
 
     char buf[6144];
     snprintf(buf, sizeof(buf),
@@ -251,29 +358,33 @@ static void cmd_stats(const char *id)
 {
     int running = 0;
     char guest_id[GUEST_ID_LEN] = "";
+    Guest g;
 
     if (id && id[0]) {
         snprintf(guest_id, sizeof(guest_id), "%s", id);
-        Guest *g = find_guest(guests, guest_count, id);
-        if (!g) {
+        if (!get_guest(id, &g)) {
             publish_result("stats", id, 0, "unknown guest");
             return;
         }
-        running = (g->state == GUEST_RUNNING);
+        running = (g.state == GUEST_RUNNING);
     }
 
     char *host_esc = malloc(262144);
     if (!host_esc) return;
+
+    /* Same literal-free() crash as cmd_exec(): host_out was replaced with a
+       string literal on failure and free()d below. Keep the fallback in a
+       separate const pointer so only a real allocation is ever freed. */
     char *host_out = run_local(STATS_CMD);
-    if (!host_out) host_out = "(failed to collect host stats)";
-    escape_json(host_out, host_esc, 262144);
+    escape_json(host_out ? host_out : "(failed to collect host stats)",
+                host_esc, 262144);
+    free(host_out);
 
     char *guest_esc = malloc(262144);
-    if (!guest_esc) { free(host_out); free(host_esc); return; }
+    if (!guest_esc) { free(host_esc); return; }
     guest_esc[0] = '\0';
     if (running) {
-        Guest *g = find_guest(guests, guest_count, id);
-        char *guest_out = ssh_exec(g, STATS_CMD);
+        char *guest_out = ssh_exec(&g, STATS_CMD);
         if (guest_out) {
             escape_json(guest_out, guest_esc, 262144);
             free(guest_out);
@@ -292,32 +403,28 @@ static void cmd_stats(const char *id)
         hms_mqtt_publish_status(&mqtt, buf);
         free(buf);
     }
-    free(host_out);
     free(host_esc);
     free(guest_esc);
 }
 
+/* Called from an OTA worker thread: copy out, act, then record the transition
+   so a following start callback does not see the pre-kill state. */
 static int ota_kill_cb(const char *id)
 {
-    Guest *g = find_guest(guests, guest_count, id);
-    if (!g || g->state != GUEST_RUNNING) return 0;
-    int rc = guest_kill(g);
-    /* Update the in-memory state so a subsequent start callback does not
-     * think the guest is still running and skip the relaunch. */
-    g->state = GUEST_STOPPED;
-    g->pid = 0;
+    Guest g;
+    if (!get_guest(id, &g) || g.state != GUEST_RUNNING) return 0;
+    int rc = guest_kill(&g);
+    set_guest_state(id, GUEST_STOPPED, 0);
     return rc;
 }
 
 static int ota_start_cb(const char *id)
 {
-    Guest *g = find_guest(guests, guest_count, id);
-    if (!g) return -1;
-    int rc = guest_start(g);
-    if (rc == 0) {
-        g->state = GUEST_RUNNING;
-        g->pid = 0; /* discoverer will pick up the real PID */
-    }
+    Guest g;
+    if (!get_guest(id, &g)) return -1;
+    int rc = guest_start(&g);
+    if (rc == 0)
+        set_guest_state(id, GUEST_RUNNING, 0); /* discoverer finds the real PID */
     return rc;
 }
 
@@ -327,8 +434,8 @@ static void cmd_ota(const char *id, const char *remote_path)
         publish_result("ota", id, 0, "usage: ota <guest> <remote_path>");
         return;
     }
-    Guest *g = find_guest(guests, guest_count, id);
-    if (!g) {
+    Guest g;
+    if (!get_guest(id, &g)) {
         publish_result("ota", id, 0, "unknown guest");
         return;
     }
@@ -354,14 +461,13 @@ static const char *base_only(const char *p)
 static void publish_guest_files(const Guest *g)
 {
     char buf[8192];
-    int pos = 0, first = 1, n;
+    int pos = 0, first = 1;
 
-    n = snprintf(buf + pos, sizeof(buf) - pos,
-                 "{\"state\":\"guest_files\",\"guest\":\"%s\",\"type\":\"%s\","
-                 "\"running\":%s,\"files\":[",
-                 g->id, guest_type_str(g->type),
-                 (g->state == GUEST_RUNNING) ? "true" : "false");
-    pos += n;
+    json_append(buf, sizeof(buf), &pos,
+                "{\"state\":\"guest_files\",\"guest\":\"%s\",\"type\":\"%s\","
+                "\"running\":%s,\"files\":[",
+                g->id, guest_type_str(g->type),
+                (g->state == GUEST_RUNNING) ? "true" : "false");
 
     char dir[GUEST_PATH_LEN];
     snprintf(dir, sizeof(dir), "/guests/%s", g->id);
@@ -384,10 +490,10 @@ static void publish_guest_files(const Guest *g)
             char jn[256], jk[64]; \
             escape_json((name), jn, sizeof(jn)); \
             escape_json((kind), jk, sizeof(jk)); \
-            pos += snprintf(buf + pos, sizeof(buf) - pos, \
-                "%s{\"name\":\"%s\",\"kind\":\"%s\",\"exists\":%s,\"size\":%lld}", \
-                first ? "" : ",", jn, jk, ex ? "true" : "false", sz); \
-            first = 0; \
+            if (json_append(buf, sizeof(buf), &pos, \
+                    "%s{\"name\":\"%s\",\"kind\":\"%s\",\"exists\":%s,\"size\":%lld}", \
+                    first ? "" : ",", jn, jk, ex ? "true" : "false", sz)) \
+                first = 0; \
         } \
     } while (0)
 
@@ -413,7 +519,9 @@ static void publish_guest_files(const Guest *g)
     }
 
 #undef GF_ADD
-    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    if ((size_t)pos > sizeof(buf) - 3)
+        pos = (int)sizeof(buf) - 3;
+    snprintf(buf + pos, sizeof(buf) - (size_t)pos, "]}");
     hms_mqtt_publish_status(&mqtt, buf);
 }
 
@@ -424,18 +532,18 @@ static void cmd_files(const char *id)
         return;
     }
     refresh();
-    Guest *g = find_guest(guests, guest_count, id);
-    if (!g) {
+    Guest g;
+    if (!get_guest(id, &g)) {
         publish_result("files", id, 0, "unknown guest");
         return;
     }
-    publish_guest_files(g);
+    publish_guest_files(&g);
 }
 
 static void cmd_fetch(const char *id, char paths[][1024], int n_paths)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("fetch", id, &g)) return;
 
     for (int i = 0; i < n_paths; i++) {
         const char *name = base_only(paths[i]);
@@ -456,8 +564,8 @@ static void cmd_fetch(const char *id, char paths[][1024], int n_paths)
 
 static void cmd_apply(const char *id, int restart)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("apply", id, &g)) return;
 
     if (ota_apply_start(&mqtt, &cfg, id, restart,
                         ota_kill_cb, ota_start_cb) != 0)
@@ -468,15 +576,15 @@ static void cmd_apply(const char *id, int restart)
 
 static void cmd_pushfiles(const char *id, const char *remote_path)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("pushfiles", id, &g)) return;
 
-    if (g->state != GUEST_RUNNING) {
+    if (g.state != GUEST_RUNNING) {
         publish_result("pushfiles", id, 0, "guest is not running");
         return;
     }
 
-    if (ota_push_start(&mqtt, &cfg, g, remote_path) != 0)
+    if (ota_push_start(&mqtt, &cfg, &g, remote_path) != 0)
         publish_result("pushfiles", id, 0, "failed to start push job");
     else
         publish_result("pushfiles", id, 1, "push job started");
@@ -484,8 +592,8 @@ static void cmd_pushfiles(const char *id, const char *remote_path)
 
 static void cmd_addfile(const char *id, const char *remote_path)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("addfile", id, &g)) return;
 
     if (ota_addfile_start(&mqtt, &cfg, id, remote_path) != 0)
         publish_result("addfile", id, 0, "failed to start add-file job");
@@ -496,6 +604,17 @@ static void cmd_addfile(const char *id, const char *remote_path)
 static void cmd_addguest(const char *id, const char *ifs_remote,
                          const char *conf_remote, const char *ip)
 {
+    /* addguest is the one command that names a directory that does not exist
+       yet, so nothing downstream can reject a bad name for us: the id goes
+       straight into "mkdir -p /guests/<id>". Anything outside the discovery
+       charset -- a '..', a ';', a '$(' -- would either escape /guests or run
+       as a shell command on the host as root. */
+    if (!guest_id_is_valid(id)) {
+        publish_result("addguest", id, 0,
+                       "invalid guest id (allowed: letters, digits, '.', '_', '-')");
+        return;
+    }
+
     if (ota_addguest_start(&mqtt, &cfg, id, ifs_remote, conf_remote, ip) != 0)
         publish_result("addguest", id, 0, "failed to start add-guest job");
     else
@@ -504,15 +623,15 @@ static void cmd_addguest(const char *id, const char *ifs_remote,
 
 static void cmd_shellopen(const char *id)
 {
-    Guest *g = find_guest_or_publish(id);
-    if (!g) return;
+    Guest g;
+    if (!find_guest_or_publish("shellopen", id, &g)) return;
 
-    if (g->state != GUEST_RUNNING) {
+    if (g.state != GUEST_RUNNING) {
         publish_result("shellopen", id, 0, "guest is not running");
         return;
     }
     char errbuf[256];
-    if (shell_open(&mqtt, g, errbuf, sizeof(errbuf)) != 0)
+    if (shell_open(&mqtt, &g, errbuf, sizeof(errbuf)) != 0)
         publish_result("shellopen", id, 0, errbuf);
     else
         publish_result("shellopen", id, 1, "shell opened");
@@ -590,23 +709,30 @@ static void handle_command(void *userdata, const char *cmd)
         char *id = strtok(NULL, " ");
         if (!id) { publish_result("fetch", NULL, 0, "usage: fetch <guest> <file> [<file>...]"); return; }
         char paths[OTA_APPLY_MAX_FILES][1024];
-        int n = 0, truncated = 0;
+        int n = 0, dropped = 0;
         char *t;
         while ((t = strtok(NULL, " ")) != NULL) {
-            if (n < OTA_APPLY_MAX_FILES - 1) {
-                snprintf(paths[n], sizeof(paths[n]), "%s", t);
-                n++;
-            } else {
-                truncated = 1;   /* drop extras beyond the cap */
-            }
+            if (n < OTA_APPLY_MAX_FILES)
+                snprintf(paths[n++], sizeof(paths[0]), "%s", t);
+            else
+                dropped++;
         }
-        if (truncated)
-            snprintf(paths[OTA_APPLY_MAX_FILES - 1], sizeof(paths[0]), "(truncated)");
-        if (n == 0 && !truncated) {
+        if (n == 0) {
             publish_result("fetch", id, 0, "no files specified");
             return;
         }
-        cmd_fetch(id, paths, truncated ? OTA_APPLY_MAX_FILES : n);
+        /* Over the cap, the extras used to be replaced by a literal
+           "(truncated)" entry that was then passed on as a file to fetch --
+           so the job failed on a file name that never existed. Fetch what
+           fits and say what was left out. */
+        if (dropped) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "too many files: fetching the first %d, %d ignored",
+                     OTA_APPLY_MAX_FILES, dropped);
+            publish_result("fetch", id, 0, msg);
+        }
+        cmd_fetch(id, paths, n);
     }
     else if (strcmp(action, "apply") == 0) {
         char *id = strtok(NULL, " ");
@@ -664,6 +790,12 @@ static void handle_command(void *userdata, const char *cmd)
     }
 }
 
+static void on_signal(int sig)
+{
+    (void)sig;
+    running = 0;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -673,6 +805,14 @@ int main(int argc, char **argv)
     printf("  =========================================\n");
 
     signal(SIGCHLD, SIG_IGN);
+    /* Ctrl-C used to leave every open shell's ssh child and the qvm children
+       behind, and dropped the broker connection without a clean disconnect. */
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+    /* A guest that closes its shell mid-write turns a write() to the ssh pipe
+       into SIGPIPE, which by default kills HMS. shell_write() already reports
+       the EPIPE. */
+    signal(SIGPIPE, SIG_IGN);
 
     config_load(&cfg);
     refresh();
@@ -683,14 +823,27 @@ int main(int argc, char **argv)
     }
     hms_mqtt_connect(&mqtt);
 
+    /* refresh_interval was read from hms.conf, stored, and then never looked
+       at: the loop slept a hardcoded 2 s, so setting it did nothing. */
+    int interval_s = cfg.refresh_interval_s > 0 ? cfg.refresh_interval_s : 2;
+    printf("  [hms] refreshing guests every %d s\n", interval_s);
+
     /* The guest list is published on demand only: in response to a "list"
        command (sent by the GUI's Refresh button) and after start/kill. */
-    while (1) {
+    while (running) {
         hms_mqtt_ensure_connected(&mqtt);
         refresh();
-        sleep(2);
+        for (int i = 0; i < interval_s * 10 && running; i++) {
+            /* nanosleep, not usleep: usleep was removed from POSIX.1-2008 and
+               the build defines _POSIX_C_SOURCE=200809L, so it has no
+               prototype here. */
+            struct timespec ts = { 0, 100 * 1000 * 1000L };
+            nanosleep(&ts, NULL);    /* interruptible by a signal */
+        }
     }
 
+    printf("\n[hms] shutting down\n");
+    shell_close_all();
     hms_mqtt_disconnect(&mqtt);
     return 0;
 }

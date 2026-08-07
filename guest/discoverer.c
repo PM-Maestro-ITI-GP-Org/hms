@@ -183,11 +183,17 @@ static void guest_fill_ip(Guest *g)
            g->id, ip);
 }
 
-static void discover_one(Guest *g, const char *dir_name)
+/* Callers must have checked the length (discover_guests() does, and reports
+   it); assert it here too so the truncation is impossible rather than merely
+   unlikely. */
+static int discover_one(Guest *g, const char *dir_name)
 {
     memset(g, 0, sizeof(*g));
 
-    snprintf(g->id,   sizeof(g->id),   "%s", dir_name);
+    size_t id_len = strlen(dir_name);
+    if (id_len >= sizeof(g->id))
+        return -1;
+    memcpy(g->id, dir_name, id_len + 1);
     g->name[0] = '\0';
     g->name_ts = 0;
     g->state = GUEST_STOPPED;
@@ -249,6 +255,7 @@ static void discover_one(Guest *g, const char *dir_name)
         if (g->ip[0] == '\0')
             guest_fill_ip(g);
     }
+    return 0;
 }
 
 int discover_guests(Guest out[MAX_GUESTS])
@@ -263,14 +270,26 @@ int discover_guests(Guest out[MAX_GUESTS])
         if (entry->d_name[0] == '.') continue;
         if (strncmp(entry->d_name, "guest-", 6) != 0) continue;
 
+        /* g->id is GUEST_ID_LEN and the name was copied into it with snprintf,
+           so a longer directory name was silently truncated -- and the guest
+           then half-worked: conf_path was built from the full name here, while
+           kill, the metadata file and every OTA path were built from the
+           truncated id and pointed at a directory that does not exist. Skip it
+           and say so instead. */
+        if (strlen(entry->d_name) >= GUEST_ID_LEN) {
+            printf("  [hms] skipping '%s': name is longer than %d characters\n",
+                   entry->d_name, GUEST_ID_LEN - 1);
+            continue;
+        }
+
         /* stat to verify it's a directory (QNX lacks d_type) */
-        char full_path[GUEST_PATH_LEN];
+        char full_path[GUEST_PATH_LEN + 16];
         snprintf(full_path, sizeof(full_path), "/guests/%s", entry->d_name);
         struct stat st;
         if (stat(full_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
 
         Guest *g = &out[count];
-        discover_one(g, entry->d_name);
+        if (discover_one(g, entry->d_name) != 0) continue;
         refresh_guest_state(g);
         count++;
     }

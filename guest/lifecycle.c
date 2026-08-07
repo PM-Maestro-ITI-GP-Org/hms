@@ -193,7 +193,11 @@ void guest_set_ip(const Guest *g)
     char meta[GUEST_PATH_LEN];
     snprintf(meta, sizeof(meta), "/guests/%s/.hms_metadata", g->id);
 
-    /* Skip if the IP is already stored */
+    /* Skip if the IP is already stored.
+       The check was strstr(line, g->ip), a substring match anywhere in the
+       line: setting 10.0.0.2 on a guest whose file already said ip=10.0.0.22
+       matched, so the write was skipped and the address silently stayed
+       wrong. Compare the value itself. */
     FILE *f = fopen(meta, "r");
     if (f) {
         char line[256];
@@ -202,7 +206,17 @@ void guest_set_ip(const Guest *g)
             while (*p == ' ' || *p == '\t') p++;
             if (p[0] == '#') p++;
             while (*p == ' ' || *p == '\t') p++;
-            if (strncmp(p, "ip=", 3) == 0 && strstr(p, g->ip)) {
+            if (strncmp(p, "ip=", 3) != 0) continue;
+
+            char *v = p + 3;
+            while (*v == ' ' || *v == '\t') v++;
+            char *end = v + strlen(v);
+            while (end > v && (end[-1] == '\n' || end[-1] == '\r' ||
+                               end[-1] == ' '  || end[-1] == '\t'))
+                end--;
+            *end = '\0';
+
+            if (strcmp(v, g->ip) == 0) {
                 fclose(f);
                 printf("  [hms] IP %s already in %s\n", g->ip, meta);
                 return;

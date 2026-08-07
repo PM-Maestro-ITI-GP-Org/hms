@@ -7,16 +7,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void on_message_cb(struct mosquitto *mosq, void *userdata,
                           const struct mosquitto_message *msg)
 {
     (void)mosq;
-    hms_mqtt_t *m = (hms_mqtt_t *)userdata;    const char *payload = (const char *)msg->payload;
+    hms_mqtt_t *m = (hms_mqtt_t *)userdata;
+    const char *payload = (const char *)msg->payload;
     int payload_len = msg->payloadlen;
 
     char cmd[2048];
-    int n = payload_len;
+    int n = (payload && payload_len > 0) ? payload_len : 0;
     if (n >= (int)sizeof(cmd)) n = (int)sizeof(cmd) - 1;
     if (n > 0)
         memcpy(cmd, payload, n);
@@ -61,9 +63,24 @@ int hms_mqtt_init(hms_mqtt_t *m, hms_cmd_callback_t cb, void *userdata)
     m->cmd_callback = cb;
     m->userdata = userdata;
 
-    m->mosq = mosquitto_new("hms", true, m);
+    /* libmosquitto requires this before any other call. It was missing
+       entirely; what it initialises (the RNG behind message ids, and the
+       library's own threading state) then depended on whatever the process
+       happened to have set up. */
+    mosquitto_lib_init();
+
+    /* The client id was the fixed string "hms". Two HMS instances -- an old
+       one that has not noticed the network dropped yet and the one that just
+       started -- present the same id, and the broker disconnects whichever
+       connected first. The pair then take turns evicting each other and
+       neither stays up long enough to answer a command. */
+    char client_id[64];
+    snprintf(client_id, sizeof(client_id), "hms_%d", (int)getpid());
+
+    m->mosq = mosquitto_new(client_id, true, m);
     if (!m->mosq) {
         fprintf(stderr, "[MQTT] Failed to create mosquitto instance\n");
+        mosquitto_lib_cleanup();
         return -1;
     }
 
@@ -134,10 +151,14 @@ void hms_mqtt_disconnect(hms_mqtt_t *m)
     m->connected = false;
     m->connecting = false;
     if (m->mosq) {
-        mosquitto_loop_stop(m->mosq, true);
+        /* Disconnect before stopping the loop: stopping it first leaves the
+           broker to time the session out on keepalive instead of seeing a
+           clean DISCONNECT. */
         mosquitto_disconnect(m->mosq);
+        mosquitto_loop_stop(m->mosq, false);
         mosquitto_destroy(m->mosq);
         m->mosq = NULL;
+        mosquitto_lib_cleanup();
     }
 }
 

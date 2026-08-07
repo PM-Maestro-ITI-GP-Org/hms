@@ -57,6 +57,18 @@ const char *guest_state_str(GuestState s);
 GuestType   guest_type_from_conf(const char *conf_path);
 
 /*
+ * Is this a name that may be pasted into /guests/<id> and into a shell command?
+ *
+ * Every id HMS acts on arrives as an MQTT payload, and the broker is on the
+ * open internet behind one shared password. Discovery only ever yields names
+ * matching this, so for the existing commands it is a no-op -- but addguest
+ * creates the directory, so its id is the one string that reaches
+ * "mkdir -p /guests/<id>" without having been checked against anything.
+ * Accepts [A-Za-z0-9._-], rejects empty, rejects a leading '.' and any "..".
+ */
+int guest_id_is_valid(const char *id);
+
+/*
  * Discover the guest's boot image filename (e.g. "qnx-guest.ifs" for QNX,
  * "boot.img"/"kernel" for Linux). The name is resolved from the qvmconf's
  * `load`/`kernel`/`bootimg` directive when present, otherwise by scanning the
