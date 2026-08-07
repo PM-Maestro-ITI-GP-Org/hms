@@ -27,12 +27,21 @@
 #include <pthread.h>
 #include <limits.h>
 
-#define OTA_STAGE_DIR "/tmp/ota"
+/* Fallback only; the real value comes from hms.conf (ota_stage_dir). See the
+ * comment on HmsConfig::ota_stage_dir for why /tmp is the wrong answer here. */
+#define OTA_STAGE_FALLBACK "/guests/.ota-stage"
+
 #define REMOTE_UPLOAD_DIR "/home/maxmaster/uploads"
 /* accept-new rather than no: the OTA server's key is pinned on the first
  * transfer and a change is refused after, which is what stops an update being
  * fetched from whatever answers on that address. Nothing prompts either way. */
 #define SCP_COMMON_OPTS "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=60"
+
+static const char *stage_root(const HmsConfig *cfg)
+{
+    return (cfg && cfg->ota_stage_dir[0]) ? cfg->ota_stage_dir
+                                          : OTA_STAGE_FALLBACK;
+}
 
 typedef struct {
     hms_mqtt_t *mqtt;
@@ -40,6 +49,7 @@ typedef struct {
     char remote_path[1024];
     char server[256];      /* user@host of the jump server */
     char ssh_key[512];     /* SSH key on the host for the server */
+    char stage_root[GUEST_PATH_LEN];
     int (*kill_guest)(const char *id);
     int (*start_guest)(const char *id);
 } ota_job_t;
@@ -374,7 +384,7 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
                      char *payload_out, size_t payload_sz)
 {
     char stage[GUEST_PATH_LEN + 1100];
-    snprintf(stage, sizeof(stage), "%s/%s/stage", OTA_STAGE_DIR, j->guest_id);
+    snprintf(stage, sizeof(stage), "%s/%s/stage", j->stage_root, j->guest_id);
 
     char qstage[3200], qpkg[3200], qdir[600];
     sh_quote(stage, qstage, sizeof(qstage));
@@ -506,7 +516,7 @@ static void *ota_thread(void *arg)
     const char *fname = strrchr(j->remote_path, '/');
     fname = fname ? fname + 1 : j->remote_path;
     snprintf(pkg, sizeof(pkg), "%s/%s/package/%s",
-             OTA_STAGE_DIR, j->guest_id, fname);
+             j->stage_root, j->guest_id, fname);
 
     ota_report(j->mqtt, j->guest_id, "download", 0, "Starting pull from server");
 
@@ -564,6 +574,7 @@ int ota_start(hms_mqtt_t *mqtt,
              cfg->ota_server[0] ? cfg->ota_server : "maxmaster@139.185.38.211");
     snprintf(j->ssh_key, sizeof(j->ssh_key), "%s",
              cfg->ota_server_key[0] ? cfg->ota_server_key : "/.ssh/id_ed25519");
+    snprintf(j->stage_root, sizeof(j->stage_root), "%s", stage_root(cfg));
     j->kill_guest = kill_guest;
     j->start_guest = start_guest;
 
@@ -886,7 +897,7 @@ int ota_fetch_start(hms_mqtt_t *mqtt, const HmsConfig *cfg,
     j->mqtt = mqtt;
     snprintf(j->guest_id, sizeof(j->guest_id), "%s", guest_id);
     snprintf(j->dest_dir, sizeof(j->dest_dir), "/guests/%s", guest_id);
-    snprintf(j->stage_dir, sizeof(j->stage_dir), "%s/%s/stage", OTA_STAGE_DIR, guest_id);
+    snprintf(j->stage_dir, sizeof(j->stage_dir), "%s/%s/stage", stage_root(cfg), guest_id);
     snprintf(j->server, sizeof(j->server), "%s",
              cfg->ota_server[0] ? cfg->ota_server : "maxmaster@139.185.38.211");
     snprintf(j->ssh_key, sizeof(j->ssh_key), "%s",
@@ -915,7 +926,7 @@ int ota_apply_start(hms_mqtt_t *mqtt, const HmsConfig *cfg,
     j->mqtt = mqtt;
     snprintf(j->guest_id, sizeof(j->guest_id), "%s", guest_id);
     snprintf(j->dest_dir, sizeof(j->dest_dir), "/guests/%s", guest_id);
-    snprintf(j->stage_dir, sizeof(j->stage_dir), "%s/%s/stage", OTA_STAGE_DIR, guest_id);
+    snprintf(j->stage_dir, sizeof(j->stage_dir), "%s/%s/stage", stage_root(cfg), guest_id);
     snprintf(j->server, sizeof(j->server), "%s",
              cfg->ota_server[0] ? cfg->ota_server : "maxmaster@139.185.38.211");
     snprintf(j->ssh_key, sizeof(j->ssh_key), "%s",
@@ -947,6 +958,7 @@ typedef struct {
     char remote_path[1024];
     char server[256];      /* user@host of the jump server */
     char ssh_key[512];     /* SSH key on the host for the server */
+    char stage_root[GUEST_PATH_LEN];
     Guest guest;           /* snapshot of the guest's SSH credentials */
 } ota_push_job_t;
 
@@ -955,7 +967,7 @@ static void *ota_push_thread(void *arg)
     ota_push_job_t *j = (ota_push_job_t *)arg;
     const char *name = base_only(j->remote_path);
     char push_dir[2048], local_tar[3200];
-    snprintf(push_dir, sizeof(push_dir), "%s/%s/push", OTA_STAGE_DIR, j->guest_id);
+    snprintf(push_dir, sizeof(push_dir), "%s/%s/push", j->stage_root, j->guest_id);
     snprintf(local_tar, sizeof(local_tar), "%s/%s", push_dir, name);
 
     ota_report(j->mqtt, j->guest_id, "pushfiles", 0,
@@ -1062,6 +1074,7 @@ int ota_push_start(hms_mqtt_t *mqtt, const HmsConfig *cfg,
              cfg->ota_server[0] ? cfg->ota_server : "maxmaster@139.185.38.211");
     snprintf(j->ssh_key, sizeof(j->ssh_key), "%s",
              cfg->ota_server_key[0] ? cfg->ota_server_key : "/.ssh/id_ed25519");
+    snprintf(j->stage_root, sizeof(j->stage_root), "%s", stage_root(cfg));
     j->guest = *g;
 
     pthread_t tid;
@@ -1081,6 +1094,7 @@ typedef struct {
     char remote_path[1024];
     char server[256];
     char ssh_key[512];
+    char stage_root[GUEST_PATH_LEN];
 } addfile_job_t;
 
 static void publish_addfile_result(addfile_job_t *j, int success, const char *msg)
@@ -1109,7 +1123,7 @@ static void *addfile_thread(void *arg)
     }
 
     char stage_dir[GUEST_PATH_LEN + 128 + 64];
-    snprintf(stage_dir, sizeof(stage_dir), "/tmp/ota/%s/addfile", j->guest_id);
+    snprintf(stage_dir, sizeof(stage_dir), "%s/%s/addfile", j->stage_root, j->guest_id);
     mkdirs(stage_dir);
 
     char local[2048];
@@ -1160,6 +1174,7 @@ int ota_addfile_start(hms_mqtt_t *mqtt, const HmsConfig *cfg,
              cfg->ota_server[0] ? cfg->ota_server : "maxmaster@139.185.38.211");
     snprintf(j->ssh_key, sizeof(j->ssh_key), "%s",
              cfg->ota_server_key[0] ? cfg->ota_server_key : "/.ssh/id_ed25519");
+    snprintf(j->stage_root, sizeof(j->stage_root), "%s", stage_root(cfg));
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, addfile_thread, j) != 0) {

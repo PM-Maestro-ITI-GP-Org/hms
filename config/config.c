@@ -23,6 +23,7 @@ void config_load(HmsConfig *cfg)
     cfg->ssh_key_path[0]   = '\0';
     cp_str(cfg->ota_server,     sizeof(cfg->ota_server),     "maxmaster@139.185.38.211");
     cp_str(cfg->ota_server_key, sizeof(cfg->ota_server_key), "/.ssh/id_ed25519");
+    cp_str(cfg->ota_stage_dir,  sizeof(cfg->ota_stage_dir),  "/guests/.ota-stage");
 
     FILE *f = fopen("/etc/hms.conf", "r");
     if (!f) return;
@@ -49,6 +50,8 @@ void config_load(HmsConfig *cfg)
             cp_str(cfg->ota_server, sizeof(cfg->ota_server), line + 11);
         else if (strncmp(line, "ota_server_key=", 15) == 0)
             cp_str(cfg->ota_server_key, sizeof(cfg->ota_server_key), line + 15);
+        else if (strncmp(line, "ota_stage_dir=", 14) == 0)
+            cp_str(cfg->ota_stage_dir, sizeof(cfg->ota_stage_dir), line + 14);
     }
     fclose(f);
 }
