@@ -52,7 +52,20 @@ static void apply_defaults(Guest *g)
 
 static void refresh(void)
 {
-    Guest scratch[MAX_GUESTS];
+    /*
+     * Heap, not stack. A Guest is ~1.7 KB and MAX_GUESTS of them is ~27 KB,
+     * and refresh() is not only called from main: cmd_list/start/kill/info/
+     * files all call it from libmosquitto's network thread, whose stack is
+     * whatever the library asked for rather than the generous one the initial
+     * thread gets. 27 KB of locals there is not worth the gamble on a target
+     * where the failure mode is a stack overflow rather than a diagnostic.
+     */
+    Guest *scratch = malloc(MAX_GUESTS * sizeof(Guest));
+    if (!scratch) {
+        fprintf(stderr, "[hms] refresh: out of memory\n");
+        return;
+    }
+
     int n = discover_guests(scratch);
     for (int i = 0; i < n; i++) {
         apply_defaults(&scratch[i]);
@@ -64,6 +77,8 @@ static void refresh(void)
         memcpy(guests, scratch, (size_t)n * sizeof(Guest));
     guest_count = n;
     pthread_mutex_unlock(&guests_lock);
+
+    free(scratch);
 }
 
 /* Copy the named guest out of the shared array. Returns 1 on success. */

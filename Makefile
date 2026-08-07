@@ -31,11 +31,20 @@ MQTT_LIBDIR ?= /usr/local/lib
 # warning settings. The flags this code requires are kept out of it, so
 # overriding CFLAGS cannot drop them.
 CFLAGS     ?= -O2 -Wall -Wextra
-# -pthread, not just -lpthread: shell.c and ota.c create threads, and on a host
-# toolchain the flag is also what defines _REENTRANT. QNX carries pthreads in
-# libc, so this is a no-op there and correct anywhere else the sources are
-# compiled -- which is how they get checked without an SDP to hand.
-APP_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_ALL_SOURCE -pthread
+APP_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -D_ALL_SOURCE
+
+# Threads.
+#
+# QNX carries pthreads in libc, so the target build needs no flag at all -- and
+# qcc is not gcc, so handing it -pthread is a way to break the build for no
+# benefit. A host toolchain does need it (it is what defines _REENTRANT and
+# links libpthread), and building on the host is how these sources get checked
+# without an SDP to hand:
+#
+#     make CC=gcc THREAD_FLAGS=-pthread MQTT_INCDIR=... MQTT_LIBDIR=...
+#
+# Default empty, which is what the target wants.
+THREAD_FLAGS ?=
 
 CPPFLAGS += -I$(MQTT_INCDIR)
 LDFLAGS  += -L$(MQTT_LIBDIR)
@@ -69,11 +78,11 @@ all: $(TARGET)
 # after touching one file compiles one file.
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(APP_CFLAGS) $(CPPFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(APP_CFLAGS) $(THREAD_FLAGS) $(CPPFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) -pthread -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
+	$(CC) $(THREAD_FLAGS) -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
 
 # Copy hms and its configuration to a running host.
 # Usage: make deploy HOST=root@192.168.2.2

@@ -251,26 +251,54 @@ static long long remote_size(const char *server, const char *ssh_key,
     return sz > 0 ? sz : -1;
 }
 
-/* The tar flag this archive needs, or NULL if it is not an archive.
- * "xzf" was used for everything except a plain .tar, so a .tar.bz2 was fed to
- * gunzip and a .xz was not recognised at all. */
-static const char *archive_tar_opt(const char *path)
+/*
+ * Which decompressor an archive needs: "gzip", "bzip2", "xz", "" for a plain
+ * tar, or NULL when the file is not an archive at all.
+ *
+ * "xzf" was previously used for everything except a plain .tar, so a .tar.bz2
+ * was handed to gunzip and a .xz was not recognised as an archive.
+ */
+static const char *archive_decompressor(const char *path)
 {
-    if (strstr(path, ".tar.gz")  || strstr(path, ".tgz"))  return "xzf";
-    if (strstr(path, ".tar.bz2") || strstr(path, ".tbz2")) return "xjf";
-    if (strstr(path, ".tar.xz")  || strstr(path, ".txz"))  return "xJf";
+    if (strstr(path, ".tar.gz")  || strstr(path, ".tgz"))  return "gzip";
+    if (strstr(path, ".tar.bz2") || strstr(path, ".tbz2")) return "bzip2";
+    if (strstr(path, ".tar.xz")  || strstr(path, ".txz"))  return "xz";
     const char *ext = strrchr(path, '.');
     if (!ext) return NULL;
-    if (strcmp(ext, ".gz")  == 0) return "xzf";
-    if (strcmp(ext, ".bz2") == 0) return "xjf";
-    if (strcmp(ext, ".xz")  == 0) return "xJf";
-    if (strcmp(ext, ".tar") == 0) return "xf";
+    if (strcmp(ext, ".gz")  == 0) return "gzip";
+    if (strcmp(ext, ".bz2") == 0) return "bzip2";
+    if (strcmp(ext, ".xz")  == 0) return "xz";
+    if (strcmp(ext, ".tar") == 0) return "";
     return NULL;
+}
+
+/*
+ * Build the extract command for an archive.
+ *
+ * gzip keeps tar's own -z, which is what this host has been extracting
+ * packages with all along and is not worth changing. The other two go through
+ * a decompressor pipe instead of tar's -j/-J: those flags are GNU extensions
+ * and the utility set that has to run this is QNX's, so a decompressor that is
+ * missing reports itself by name rather than tar rejecting an option it has
+ * never heard of. (The pipeline's exit status is tar's, which is the one that
+ * matters -- tar fails on garbage input either way.)
+ */
+static void build_extract_cmd(const char *pkg, const char *qpkg,
+                              const char *qstage, char *out, size_t out_sz)
+{
+    const char *dc = archive_decompressor(pkg);
+
+    if (dc && strcmp(dc, "gzip") == 0)
+        snprintf(out, out_sz, "tar -xzf %s -C %s", qpkg, qstage);
+    else if (dc && dc[0])
+        snprintf(out, out_sz, "%s -dc %s | tar -xf - -C %s", dc, qpkg, qstage);
+    else
+        snprintf(out, out_sz, "tar -xf %s -C %s", qpkg, qstage);
 }
 
 static int is_archive(const char *path)
 {
-    return archive_tar_opt(path) != NULL;
+    return archive_decompressor(path) != NULL;
 }
 
 /*
@@ -370,7 +398,9 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
         mkdirs(stage);
 
         ota_report(j->mqtt, j->guest_id, "extract", 0, "Extracting package");
-        int rc = run_cmd("tar -%s %s -C %s", archive_tar_opt(pkg), qpkg, qstage);
+        char extract[8192];
+        build_extract_cmd(pkg, qpkg, qstage, extract, sizeof(extract));
+        int rc = run_cmd("%s", extract);
         if (rc != 0) {
             ota_report(j->mqtt, j->guest_id, "extract", 0, "Extraction failed");
             return -1;
@@ -414,8 +444,10 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
 
         /* The trailing /. copies the *contents* of the payload root, so the
            guest directory is updated in place rather than gaining a nested
-           copy of the archive's top-level folder. */
-        rc = run_cmd("cp -rf %s/. %s/", qpayload, qdir);
+           copy of the archive's top-level folder.
+           -R rather than -r: -R is the flag POSIX specifies for cp, and the
+           QNX utility set is the one that has to run this. */
+        rc = run_cmd("cp -Rf %s/. %s/", qpayload, qdir);
         if (rc != 0) {
             ota_report(j->mqtt, j->guest_id, "apply", 0,
                        "Failed to copy the package into the guest directory");

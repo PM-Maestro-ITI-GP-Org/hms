@@ -151,11 +151,17 @@ void hms_mqtt_disconnect(hms_mqtt_t *m)
     m->connected = false;
     m->connecting = false;
     if (m->mosq) {
-        /* Disconnect before stopping the loop: stopping it first leaves the
-           broker to time the session out on keepalive instead of seeing a
-           clean DISCONNECT. */
+        /* Disconnect first so the broker sees a clean DISCONNECT rather than
+           timing the session out on keepalive.
+
+           The loop is still stopped with force=true. force=false joins the
+           network thread, and that thread only returns once it notices the
+           disconnect -- which it never does if HMS was killed while the broker
+           was unreachable and the thread is sitting in a reconnect backoff.
+           Hanging on Ctrl-C is a worse failure than a cancelled thread in a
+           process that is about to exit anyway. */
         mosquitto_disconnect(m->mosq);
-        mosquitto_loop_stop(m->mosq, false);
+        mosquitto_loop_stop(m->mosq, true);
         mosquitto_destroy(m->mosq);
         m->mosq = NULL;
         mosquitto_lib_cleanup();
