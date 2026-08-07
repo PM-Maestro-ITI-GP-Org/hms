@@ -121,6 +121,7 @@ static void ota_publish_result(hms_mqtt_t *mqtt, const char *guest_id,
 }
 
 static void msleep(long ms);
+static int is_control_file(const char *name);
 
 /*
  * Wait for a child that cannot be waited for.
@@ -252,53 +253,42 @@ static long long remote_size(const char *server, const char *ssh_key,
 }
 
 /*
- * Which decompressor an archive needs: "gzip", "bzip2", "xz", "" for a plain
- * tar, or NULL when the file is not an archive at all.
+ * Is this package an archive to unpack, or a single file to drop in place?
  *
- * "xzf" was previously used for everything except a plain .tar, so a .tar.bz2
- * was handed to gunzip and a .xz was not recognised as an archive.
+ * Only the classification is done from the name. *How* to unpack it is not:
+ * see the extract command below.
  */
-static const char *archive_decompressor(const char *path)
+static int is_archive(const char *path)
 {
-    if (strstr(path, ".tar.gz")  || strstr(path, ".tgz"))  return "gzip";
-    if (strstr(path, ".tar.bz2") || strstr(path, ".tbz2")) return "bzip2";
-    if (strstr(path, ".tar.xz")  || strstr(path, ".txz"))  return "xz";
+    if (strstr(path, ".tar.gz")  || strstr(path, ".tgz"))  return 1;
+    if (strstr(path, ".tar.bz2") || strstr(path, ".tbz2")) return 1;
+    if (strstr(path, ".tar.xz")  || strstr(path, ".txz"))  return 1;
     const char *ext = strrchr(path, '.');
-    if (!ext) return NULL;
-    if (strcmp(ext, ".gz")  == 0) return "gzip";
-    if (strcmp(ext, ".bz2") == 0) return "bzip2";
-    if (strcmp(ext, ".xz")  == 0) return "xz";
-    if (strcmp(ext, ".tar") == 0) return "";
-    return NULL;
+    if (!ext) return 0;
+    return strcmp(ext, ".tar") == 0 || strcmp(ext, ".gz")  == 0
+        || strcmp(ext, ".bz2") == 0 || strcmp(ext, ".xz")  == 0;
 }
 
 /*
- * Build the extract command for an archive.
+ * Extract with a plain `tar -xf` and no compression flag at all.
  *
- * gzip keeps tar's own -z, which is what this host has been extracting
- * packages with all along and is not worth changing. The other two go through
- * a decompressor pipe instead of tar's -j/-J: those flags are GNU extensions
- * and the utility set that has to run this is QNX's, so a decompressor that is
- * missing reports itself by name rather than tar rejecting an option it has
- * never heard of. (The pipeline's exit status is tar's, which is the one that
- * matters -- tar fails on garbage input either way.)
+ * Both tars that can be under /usr/bin/tar here detect the compression from
+ * the file's own magic when extracting, so naming it is unnecessary -- and
+ * naming it is what kept going wrong. The original passed -z to everything
+ * except a plain .tar, handing a .tar.bz2 to gunzip. Replacing that with
+ * -z/-j/-J assumed flags the tar on the target may not have been built with.
+ * Replacing *that* with a `bzip2 -dc | tar -xf -` pipe was worse still: the
+ * host image links only /usr/bin/tar and /usr/bin/gzip out of toybox, so
+ * there is no bzip2 or xz binary on the box for the pipe to run.
+ *
+ * `tar -xf` needs none of it. It is the same command for every archive type,
+ * it works on the toybox tar this image ships and on the bsdtar in the SDP,
+ * and it depends on no separate decompressor being installed.
  */
-static void build_extract_cmd(const char *pkg, const char *qpkg,
-                              const char *qstage, char *out, size_t out_sz)
+static void build_extract_cmd(const char *qpkg, const char *qstage,
+                              char *out, size_t out_sz)
 {
-    const char *dc = archive_decompressor(pkg);
-
-    if (dc && strcmp(dc, "gzip") == 0)
-        snprintf(out, out_sz, "tar -xzf %s -C %s", qpkg, qstage);
-    else if (dc && dc[0])
-        snprintf(out, out_sz, "%s -dc %s | tar -xf - -C %s", dc, qpkg, qstage);
-    else
-        snprintf(out, out_sz, "tar -xf %s -C %s", qpkg, qstage);
-}
-
-static int is_archive(const char *path)
-{
-    return archive_decompressor(path) != NULL;
+    snprintf(out, out_sz, "tar -xf %s -C %s", qpkg, qstage);
 }
 
 /*
@@ -399,7 +389,7 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
 
         ota_report(j->mqtt, j->guest_id, "extract", 0, "Extracting package");
         char extract[8192];
-        build_extract_cmd(pkg, qpkg, qstage, extract, sizeof(extract));
+        build_extract_cmd(qpkg, qstage, extract, sizeof(extract));
         int rc = run_cmd("%s", extract);
         if (rc != 0) {
             ota_report(j->mqtt, j->guest_id, "extract", 0, "Extraction failed");
@@ -439,20 +429,54 @@ static int ota_apply(const ota_job_t *j, const char *pkg, const char *guest_dir,
         ota_report(j->mqtt, j->guest_id, "apply", 50,
                    "Installing files into the guest directory");
 
-        char qpayload[3200];
-        sh_quote(payload, qpayload, sizeof(qpayload));
-
-        /* The trailing /. copies the *contents* of the payload root, so the
-           guest directory is updated in place rather than gaining a nested
-           copy of the archive's top-level folder.
-           -R rather than -r: -R is the flag POSIX specifies for cp, and the
-           QNX utility set is the one that has to run this. */
-        rc = run_cmd("cp -Rf %s/. %s/", qpayload, qdir);
-        if (rc != 0) {
+        /*
+         * Copy the payload root's entries one at a time rather than with
+         * `cp -Rf <payload>/. <guest_dir>/`.
+         *
+         * The trailing "/." is a GNU idiom for "the contents, not the
+         * directory", and the cp that has to run this is toybox's -- the host
+         * image links /bin/cp to toybox, not to a GNU coreutils. Naming each
+         * entry says the same thing in a way no cp can read differently, and
+         * it also means one unreadable file is reported as that file instead
+         * of as a whole failed update.
+         */
+        DIR *pd = opendir(payload);
+        if (!pd) {
             ota_report(j->mqtt, j->guest_id, "apply", 0,
-                       "Failed to copy the package into the guest directory");
+                       "Extracted package is empty");
             return -1;
         }
+
+        int copied = 0, failed = 0;
+        struct dirent *pe;
+        while ((pe = readdir(pd)) != NULL) {
+            if (strcmp(pe->d_name, ".") == 0 || strcmp(pe->d_name, "..") == 0)
+                continue;
+            /* Never let an archive overwrite HMS's own runtime files. */
+            if (is_control_file(pe->d_name)) {
+                printf("[ota] skipping control file '%s' from the package\n",
+                       pe->d_name);
+                continue;
+            }
+
+            char src[GUEST_PATH_LEN + 1400 + 300];
+            snprintf(src, sizeof(src), "%s/%s", payload, pe->d_name);
+
+            char qsrc[6400];
+            sh_quote(src, qsrc, sizeof(qsrc));
+            if (run_cmd("cp -Rf %s %s/", qsrc, qdir) == 0) copied++;
+            else                                           failed++;
+        }
+        closedir(pd);
+
+        if (copied == 0 || failed > 0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "Installed %d file(s), %d failed", copied, failed);
+            ota_report(j->mqtt, j->guest_id, "apply", 0, msg);
+            return -1;
+        }
+
         (void)run_cmd("rm -rf %s", qstage);
         return 0;
     }
