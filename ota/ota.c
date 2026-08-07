@@ -1067,9 +1067,10 @@ static void *addfile_thread(void *arg)
     int ok = (pull_file(j->server, j->ssh_key, j->remote_path, local, remote_sz,
                         j->guest_id, j->mqtt, "addfile", 0, 1) == 0);
     if (ok) {
-        char dest[GUEST_PATH_LEN + 300];
+        /* `name` is a basename out of remote_path, which is 1024 bytes. */
+        char dest[GUEST_PATH_LEN + 1024 + 8];
         snprintf(dest, sizeof(dest), "%s/%s", guest_dir, name);
-        char qsrc[4200], qdest[1400];
+        char qsrc[4200], qdest[2700];
         sh_quote(local, qsrc, sizeof(qsrc));
         sh_quote(dest, qdest, sizeof(qdest));
         ok = (run_cmd("cp -f %s %s", qsrc, qdest) == 0);
