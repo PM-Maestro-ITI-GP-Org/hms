@@ -176,16 +176,23 @@ static void publish_guest_list(void)
     json_append(buf, sizeof(buf), &pos, "{\"state\":\"guest_list\",\"guests\":[");
     for (int i = 0; i < guest_count; i++) {
         Guest *g = &guests[i];
+        /* "running" is a fact about qvm, not about the guest being usable:
+           qvm exists immediately, sshd inside the guest only once it has
+           booted. Everything SSH-based fails with "Connection refused" in
+           between, which reads as broken rather than as not-ready-yet.
+           refresh_guest_name() already establishes reachability -- it fetches
+           the hostname over SSH -- so reporting it costs nothing. */
         if (!json_append(buf, sizeof(buf), &pos,
                          "%s{\"id\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"state\":\"%s\","
-                         "\"pid\":%d,\"ip\":\"%s\"}",
+                         "\"pid\":%d,\"ip\":\"%s\",\"reachable\":%s}",
                          i ? "," : "",
                          g->id,
                          g->name[0] ? g->name : "-",
                          guest_type_str(g->type),
                          guest_state_str(g->state),
                          g->pid,
-                         g->ip[0] ? g->ip : "-"))
+                         g->ip[0] ? g->ip : "-",
+                         g->name[0] ? "true" : "false"))
             break;
     }
     pthread_mutex_unlock(&guests_lock);
