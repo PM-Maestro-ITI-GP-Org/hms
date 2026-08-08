@@ -382,8 +382,15 @@ char *ssh_exec_diag(const Guest *g, const char *command,
      * Empty output with a silent stderr is now a success, which is what it is.
      */
     if (len == 0 && err[0]) {
-        printf("  [ssh] '%s' on %s failed: %s\n", command, g->id, err);
-        if (errbuf) snprintf(errbuf, errbuf_sz, "%s", err);
+        /* Only shout when the caller has no other way to see this. A caller
+           that passed errbuf reports the failure itself -- and the loudest
+           caller is the reachability poll, which runs per guest per refresh
+           cycle and filled the console with "Connection refused" for the whole
+           time a guest was booting. */
+        if (!errbuf)
+            printf("  [ssh] '%s' on %s failed: %s\n", command, g->id, err);
+        else
+            snprintf(errbuf, errbuf_sz, "%s", err);
         free(out);
         return NULL;
     }

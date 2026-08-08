@@ -13,6 +13,15 @@
 #define HMS_CMD_TOPIC    "hms/cmd"
 #define HMS_STATUS_TOPIC "hms/status"
 
+/* Exactly-once delivery, both directions. One constant so the two ends cannot
+ * drift apart -- the GUI uses the same value.
+ *
+ * The cost is real: QoS 2 is a four-part handshake per message, so on the
+ * board's ~145ms link to the broker each publish costs roughly half a second
+ * of round trips rather than none. It buys no duplicated commands and no lost
+ * results, which for start/kill/ota is worth more than the latency. */
+#define HMS_MQTT_QOS 2
+
 typedef void (*hms_cmd_callback_t)(void *userdata, const char *cmd);
 
 typedef struct hms_mqtt {

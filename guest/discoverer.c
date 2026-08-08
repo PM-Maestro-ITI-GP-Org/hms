@@ -498,6 +498,34 @@ void refresh_guest_state(Guest *g)
     }
 }
 
+/*
+ * Say "not answering yet" once per guest rather than once per probe.
+ *
+ * Reset when the guest answers or stops, so the next boot reports again.
+ * Returns 1 if this guest has already been announced as unreachable.
+ */
+static char unreach_log[MAX_GUESTS][GUEST_ID_LEN];
+
+static int unreachable_announced(const char *id)
+{
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (unreach_log[i][0] && strcmp(unreach_log[i], id) == 0)
+            return 1;
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (!unreach_log[i][0]) {
+            snprintf(unreach_log[i], GUEST_ID_LEN, "%s", id);
+            return 0;
+        }
+    return 1;   /* table full: stay quiet rather than repeat */
+}
+
+static void unreachable_forget(const char *id)
+{
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (unreach_log[i][0] && strcmp(unreach_log[i], id) == 0)
+            unreach_log[i][0] = '\0';
+}
+
 void refresh_guest_name(Guest *g)
 {
     const char *cached = name_cache_get(g->id);
@@ -506,6 +534,7 @@ void refresh_guest_name(Guest *g)
         /* While stopped the name is unknown; evict and refetch after a restart. */
         if (cached)
             name_cache_put(g->id, NULL);
+        unreachable_forget(g->id);   /* so the next boot reports again */
         g->name[0] = '\0';
         g->name_ts = 0;
         return;
@@ -526,10 +555,22 @@ void refresh_guest_name(Guest *g)
 
     /* `uname -n` rather than `hostname`: the guest images carry the same
        toybox as the host, and it has no hostname applet, so this fetch always
-       came back empty and every guest showed its name as "-". */
-    char *out = ssh_exec(g, "uname -n");
-    if (!out)
+       came back empty and every guest showed its name as "-".
+
+       This doubles as the reachability probe, so it runs every cycle for a
+       guest that is up but not answering -- which is the normal state for the
+       thirty-odd seconds a guest takes to boot. Passing errbuf keeps
+       ssh_exec_diag quiet; the transition is logged once, below, instead of
+       the failure being logged every time. */
+    char why[512];
+    char *out = ssh_exec_diag(g, "uname -n", why, sizeof(why));
+    if (!out) {
+        if (!unreachable_announced(g->id)) {
+            printf("  [hms] guest '%s' is up but not answering ssh yet (%s)\n",
+                   g->id, why[0] ? why : "no reason given");
+        }
         return;
+    }
 
     /* Trim trailing whitespace / newline */
     size_t len = strlen(out);
@@ -544,7 +585,8 @@ void refresh_guest_name(Guest *g)
 
     if (g->name[0] != '\0') {
         name_cache_put(g->id, g->name);
-        printf("  [hms] guest '%s' hostname: %s\n", g->id, g->name);
+        unreachable_forget(g->id);   /* it answered; report again if it stops */
+        printf("  [hms] guest '%s' is up: %s\n", g->id, g->name);
     }
 }
 

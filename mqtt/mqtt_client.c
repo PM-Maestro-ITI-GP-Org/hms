@@ -39,7 +39,7 @@ static void on_connect_cb(struct mosquitto *mosq, void *userdata, int rc)
         m->connected = true;
         m->connecting = false;
         printf("[MQTT] Connected to broker %s:%d\n", MQTT_BROKER, MQTT_PORT);
-        mosquitto_subscribe(m->mosq, NULL, HMS_CMD_TOPIC, 0);
+        mosquitto_subscribe(m->mosq, NULL, HMS_CMD_TOPIC, HMS_MQTT_QOS);
         printf("[MQTT] Subscribed to %s\n", HMS_CMD_TOPIC);
     } else {
         m->connected = false;
@@ -172,7 +172,8 @@ int hms_mqtt_publish(hms_mqtt_t *m, const char *topic, const char *payload)
 {
     if (!m->mosq || !m->connected) return -1;
     size_t len = strlen(payload);
-    int rc = mosquitto_publish(m->mosq, NULL, topic, len, payload, 0, false);
+    int rc = mosquitto_publish(m->mosq, NULL, topic, len, payload,
+                               HMS_MQTT_QOS, false);
     if (rc != MOSQ_ERR_SUCCESS) {
         fprintf(stderr, "[MQTT] publish to %s failed: %s\n",
                 topic, mosquitto_strerror(rc));
