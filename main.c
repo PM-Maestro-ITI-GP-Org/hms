@@ -371,15 +371,38 @@ static void cmd_exec(const char *id, const char *command)
  * nothing, several times a second while the Monitor tab was open. `uname -n`
  * gives the same node name, is in this toybox's applet list, and is POSIX, so
  * it works inside a Linux guest too. */
+/*
+ * One bundle that has to work on the QNX host, a QNX guest and a Linux guest.
+ *
+ * It was QNX-only: pidin does not exist on Linux, so every section of the
+ * Linux guest's stats came back as "not found" and its Monitor tab was blank
+ * with no explanation. Rather than branch on g->type -- which puts the
+ * knowledge in the caller and does the wrong thing the moment a guest's type
+ * is mislabelled in its metadata -- each section tries the QNX tool, then the
+ * Linux one, then something universal, and takes whichever answers first.
+ *
+ * `pidin cpu` is gone. It is not a valid pidin shorthand ("invalid or
+ * ambiguous shorthand"), so on QNX that section only ever produced an error,
+ * and on Linux it produced nothing at all. `pidin times` is the real one.
+ *
+ * Every section is capped with head. Uncapped, a single QNX guest returned
+ * 56 KB -- almost all of it the full per-thread process table -- which after
+ * JSON escaping, doubled for host+guest, is close to a megabyte on the wire
+ * every poll, for a page that displays a few dozen rows.
+ */
 static const char STATS_CMD[] =
-    "echo; echo '###HOSTNAME'; uname -n;"
-    "echo; echo '###KERNEL'; uname -a;"
-    "echo; echo '###UPTIMESEC'; cat /proc/uptime 2>/dev/null;"
-    "echo; echo '###CPUINFO'; pidin info;"
-    "echo; echo '###CPUUSE'; pidin cpu 2>/dev/null;"
-    "echo; echo '###MEM'; pidin mem;"
-    "echo; echo '###PROC'; top -b -i 1;"
-    "echo; echo '###END'";
+    "echo '###HOSTNAME'; uname -n 2>/dev/null;"
+    "echo '###KERNEL'; uname -a 2>/dev/null;"
+    "echo '###UPTIMESEC'; (cat /proc/uptime 2>/dev/null || uptime 2>/dev/null) | head -2;"
+    "echo '###CPUINFO'; (pidin info 2>/dev/null || cat /proc/cpuinfo 2>/dev/null"
+        " || nproc 2>/dev/null) | head -20;"
+    "echo '###CPUUSE'; (pidin times 2>/dev/null || cat /proc/stat 2>/dev/null)"
+        " | head -12;"
+    "echo '###MEM'; (pidin mem 2>/dev/null || free -m 2>/dev/null"
+        " || cat /proc/meminfo 2>/dev/null) | head -25;"
+    "echo '###PROC'; (top -b -i 1 2>/dev/null || top -b -n 1 2>/dev/null"
+        " || ps aux 2>/dev/null || ps -A 2>/dev/null) | head -40;"
+    "echo '###END'";
 
 /* Capture the output of a local shell command. Caller must free(). */
 static char *run_local(const char *command)
@@ -935,18 +958,31 @@ static void handle_command(void *userdata, const char *cmd)
      * already running answers a question that is about to be answered anyway,
      * so drop it rather than queue it.
      */
+    /*
+     * Queue space is checked BEFORE the stats flag is claimed, and this order
+     * is load-bearing.
+     *
+     * It used to be the other way round: stats_running was set, and then the
+     * full-queue check returned without ever clearing it. Only a worker clears
+     * the flag, and a worker only runs commands that made it into the queue --
+     * so a single stats arriving while the queue happened to be full left the
+     * flag stuck at 1 for the lifetime of the process, and every stats after
+     * that was silently dropped by the coalescing branch below. The Monitor
+     * page then simply never received anything again, with HMS otherwise
+     * healthy and answering everything else, which is exactly how it looked.
+     */
+    if (cmdq.count == CMD_QUEUE_MAX) {
+        pthread_mutex_unlock(&cmdq.lock);
+        fprintf(stderr, "[hms] command queue full, dropping: %.64s\n", cmd);
+        return;
+    }
+
     if (is_stats_cmd(cmd)) {
         if (cmdq.stats_running) {
             pthread_mutex_unlock(&cmdq.lock);
             return;
         }
         cmdq.stats_running = 1;
-    }
-
-    if (cmdq.count == CMD_QUEUE_MAX) {
-        pthread_mutex_unlock(&cmdq.lock);
-        fprintf(stderr, "[hms] command queue full, dropping: %.64s\n", cmd);
-        return;
     }
 
     snprintf(cmdq.items[cmdq.tail], sizeof(cmdq.items[0]), "%s", cmd);
