@@ -7,37 +7,58 @@
 #include <sys/stat.h>
 
 /*
- * Is sshpass on the host PATH?
+ * Is `cmd` on the PATH? The answer cannot change while HMS runs, so it is
+ * looked up once and remembered in *cache (-1 unknown, 0 no, 1 yes).
  *
- * This was a fresh fork+exec of a shell writing to a /tmp file on *every*
- * ssh_exec() -- which the discoverer calls once per guest per refresh cycle,
- * so several times a second. Worse, the sequence counter it used to name that
- * file was a plain static++ touched from the mosquitto callback thread, the
- * OTA workers and the main loop at once, so two callers could pick the same
- * name and read back each other's answer.
- *
- * The answer cannot change while HMS runs, so look once and remember.
+ * This used to be a fresh fork+exec of a shell writing to a /tmp file on
+ * *every* ssh_exec() -- which the discoverer calls once per guest per refresh
+ * cycle. Worse, the sequence counter naming that file was a plain static++
+ * touched from three thread contexts at once, so two callers could pick the
+ * same name and read back each other's answer.
  */
-static int have_sshpass(void)
+static int have_cmd(const char *cmd, int *cache)
 {
-    static int cached = -1;
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
     pthread_mutex_lock(&lock);
-    if (cached < 0) {
-        cached = 0;
-        FILE *fp = popen("command -v sshpass 2>/dev/null", "r");
+    if (*cache < 0) {
+        char probe[128];
+        snprintf(probe, sizeof(probe), "command -v %s 2>/dev/null", cmd);
+        *cache = 0;
+        FILE *fp = popen(probe, "r");
         if (fp) {
             char line[256];
             if (fgets(line, sizeof(line), fp) && line[0] == '/')
-                cached = 1;
+                *cache = 1;
             pclose(fp);
         }
     }
-    int r = cached;
+    int r = *cache;
     pthread_mutex_unlock(&lock);
     return r;
 }
+
+static int have_sshpass(void) { static int c = -1; return have_cmd("sshpass", &c); }
+static int have_timeout(void) { static int c = -1; return have_cmd("timeout", &c); }
+
+/*
+ * A wall-clock cap on a single ssh command.
+ *
+ * ConnectTimeout only bounds the TCP connect. Everything after it -- key
+ * exchange, auth, the command itself -- is unbounded, so an ssh to a guest
+ * that accepts the connection and then stops answering hangs forever. That is
+ * not hypothetical: it wedged HMS on the board. Five `ssh ... uname -n`
+ * processes were left REPLY-blocked, and because refresh() and all four
+ * command workers each call through here, every one of them ended up stuck in
+ * popen() and HMS stopped answering MQTT entirely while still looking alive.
+ *
+ * 20s: longer than any command HMS issues (the slowest is the stats bundle),
+ * and shorter than the GUI's own 15s command timeout is useful beyond.
+ *
+ * ponytail: fixed cap for every exec; make it a per-call argument if a
+ * legitimately long-running `exec` from the shell ever needs more.
+ */
+#define SSH_EXEC_TIMEOUT "20"
 
 /* Check if a file exists */
 static int file_exists(const char *path)
@@ -243,29 +264,39 @@ char *ssh_exec_diag(const Guest *g, const char *command,
     char errfile[128];
     tmp_name(errfile, sizeof(errfile), "ssherr");
 
+    /* -k 5: SIGTERM at the cap, SIGKILL five seconds later if ssh ignores it. */
+    const char *tmo = have_timeout() ? "timeout -k 5 " SSH_EXEC_TIMEOUT " " : "";
+
+    /* The exit status, via a file. QNX's pclose() returns -1 even for a child
+       that exited 0, so it cannot be used -- and without the status a command
+       killed by `timeout` is indistinguishable from one that succeeded and
+       printed nothing. `timeout` exits 124 when it fires. */
+    char rcfile[128];
+    tmp_name(rcfile, sizeof(rcfile), "sshrc");
+
     char cmd[4096];
     int n;
     if (g->ssh_password[0] != '\0' && have_sshpass()) {
         /* Password auth via sshpass */
         n = snprintf(cmd, sizeof(cmd),
-            "sshpass -p '%s' ssh %s %s@%s \"%s\" 2>%s",
-            g->ssh_password, ssh_opts, g->ssh_user, g->ip, command, errfile);
+            "%ssshpass -p '%s' ssh %s %s@%s \"%s\" 2>%s; echo $? >%s",
+            tmo, g->ssh_password, ssh_opts, g->ssh_user, g->ip, command, errfile, rcfile);
     } else if (g->ssh_key[0] != '\0' && file_exists(g->ssh_key)) {
         /* Key-based auth with explicit identity */
         n = snprintf(cmd, sizeof(cmd),
-            "ssh -o BatchMode=yes %s %s@%s \"%s\" 2>%s",
-            ssh_opts, g->ssh_user, g->ip, command, errfile);
+            "%sssh -o BatchMode=yes %s %s@%s \"%s\" 2>%s; echo $? >%s",
+            tmo, ssh_opts, g->ssh_user, g->ip, command, errfile, rcfile);
     } else if (g->ssh_password[0] != '\0') {
         /* Password configured but no sshpass and no key */
         printf("  [ssh] WARNING: password set but 'sshpass' not found and no SSH key available.\n");
         n = snprintf(cmd, sizeof(cmd),
-            "ssh -o BatchMode=yes %s %s@%s \"%s\" 2>%s",
-            ssh_opts, g->ssh_user, g->ip, command, errfile);
+            "%sssh -o BatchMode=yes %s %s@%s \"%s\" 2>%s; echo $? >%s",
+            tmo, ssh_opts, g->ssh_user, g->ip, command, errfile, rcfile);
     } else {
         /* Default: no password, no key — rely on ssh-agent */
         n = snprintf(cmd, sizeof(cmd),
-            "ssh %s %s@%s \"%s\" 2>%s",
-            ssh_opts, g->ssh_user, g->ip, command, errfile);
+            "%sssh %s %s@%s \"%s\" 2>%s; echo $? >%s",
+            tmo, ssh_opts, g->ssh_user, g->ip, command, errfile, rcfile);
     }
 
     if (n >= (int)sizeof(cmd)) {
@@ -310,6 +341,27 @@ char *ssh_exec_diag(const Guest *g, const char *command,
         fclose(ef);
     }
     remove(errfile);
+
+    int rc = -1;
+    FILE *rf = fopen(rcfile, "r");
+    if (rf) {
+        if (fscanf(rf, "%d", &rc) != 1) rc = -1;
+        fclose(rf);
+    }
+    remove(rcfile);
+
+    /* `timeout` exits 124. Without this the kill looks like a command that
+       succeeded and printed nothing -- which would mark an unreachable guest
+       as reachable and hide the very failure the cap exists to surface. */
+    if (rc == 124) {
+        snprintf(err, sizeof(err),
+                 "no response within %ss (ssh was killed)", SSH_EXEC_TIMEOUT);
+        printf("  [ssh] '%s' on %s timed out after %ss\n",
+               command, g->id, SSH_EXEC_TIMEOUT);
+        if (errbuf) snprintf(errbuf, errbuf_sz, "%s", err);
+        free(out);
+        return NULL;
+    }
 
     /* Trim trailing newlines so the text sits on one line in the GUI. */
     size_t elen = strlen(err);
