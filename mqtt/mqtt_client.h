@@ -113,6 +113,14 @@ void hms_mqtt_disconnect(hms_mqtt_t *m);
 void hms_mqtt_ensure_connected(hms_mqtt_t *m);
 int hms_mqtt_publish(hms_mqtt_t *m, const char *topic, const char *payload);
 int hms_mqtt_publish_status(hms_mqtt_t *m, const char *payload);
+
+/* Same, but choosing the QoS. For the periodic guest list, which is repeated
+ * state rather than an event: at QoS 2 a publish every couple of seconds would
+ * spend a large slice of the link on four-part handshakes re-confirming a list
+ * that is about to be sent again anyway. */
+int hms_mqtt_publish_qos(hms_mqtt_t *m, const char *topic, const char *payload,
+                         int qos);
+int hms_mqtt_publish_status_qos(hms_mqtt_t *m, const char *payload, int qos);
 bool hms_mqtt_connected(const hms_mqtt_t *m);
 
 #endif

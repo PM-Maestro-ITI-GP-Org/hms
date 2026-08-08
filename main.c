@@ -167,7 +167,7 @@ static int json_append(char *buf, size_t sz, int *pos, const char *fmt, ...)
     return 1;
 }
 
-static void publish_guest_list(void)
+static void publish_guest_list_qos(int qos)
 {
     char buf[8192];
     int pos = 0;
@@ -203,48 +203,14 @@ static void publish_guest_list(void)
     if ((size_t)pos > sizeof(buf) - 3)
         pos = (int)sizeof(buf) - 3;
     snprintf(buf + pos, sizeof(buf) - (size_t)pos, "]}");
-    hms_mqtt_publish_status(&mqtt, buf);
+    hms_mqtt_publish_status_qos(&mqtt, buf, qos);
 }
 
-/*
- * A fingerprint of everything publish_guest_list() puts on the wire.
- *
- * The refresh loop learns about guests becoming reachable, dying, or being
- * started from the console -- and then told nobody. The list was published
- * only in reply to "list" and after start/kill, so the interesting transition
- * was always the one that got lost: `start` publishes while the guest is still
- * booting and unreachable, the guest finishes booting a few seconds later, and
- * the GUI sat on "starting" until someone pressed Refresh.
- *
- * Comparing this against the previous cycle turns the loop into a push: the
- * GUI is told the moment anything actually changes, and an idle board stays
- * silent instead of republishing an identical list twice a second.
- *
- * Every field the payload carries is included, because a change the
- * fingerprint cannot see is a change the GUI never hears about. `name` is in
- * here for exactly that reason -- it is what "reachable" is derived from.
- *
- * ponytail: fixed buffer. Two states could collide once the text overflows it,
- * which needs far more guests than MAX_GUESTS allows; revisit with a hash if
- * that ever stops being true.
- */
-static void guests_fingerprint(char *out, size_t sz)
+/* A reply to something the user did (list / start / kill): sent exactly once,
+   so a dropped packet cannot leave a button looking like it did nothing. */
+static void publish_guest_list(void)
 {
-    size_t pos = 0;
-    out[0] = '\0';
-
-    pthread_mutex_lock(&guests_lock);
-    for (int i = 0; i < guest_count; i++) {
-        const Guest *g = &guests[i];
-        if (pos + 1 >= sz) break;
-        int n = snprintf(out + pos, sz - pos, "%s|%s|%d|%d|%s|%s;",
-                         g->id, g->name, (int)g->state, g->pid,
-                         g->ip, guest_type_str(g->type));
-        if (n < 0) break;
-        if ((size_t)n >= sz - pos) { pos = sz - 1; out[pos] = '\0'; break; }
-        pos += (size_t)n;
-    }
-    pthread_mutex_unlock(&guests_lock);
+    publish_guest_list_qos(HMS_MQTT_QOS);
 }
 
 static void publish_guest_info(const Guest *g)
@@ -1047,30 +1013,35 @@ int main(int argc, char **argv)
     int interval_s = cfg.refresh_interval_s > 0 ? cfg.refresh_interval_s : 2;
     printf("  [hms] refreshing guests every %d s\n", interval_s);
 
-    /* The guest list is published in reply to "list" and after start/kill, and
-       additionally whenever this loop notices it has changed -- see
-       guests_fingerprint(). Without that last part the GUI never learned that a
-       guest it had just started had finished booting. */
-    char fp_prev[8192] = "";
-    char fp_now[8192];
-
+    /*
+     * The full guest list goes out every cycle, unconditionally.
+     *
+     * This started as change detection -- fingerprint the list, publish only
+     * when it differed -- which worked but was the wrong shape. Sending state
+     * rather than events means there is no such thing as a missed edge: every
+     * cycle the GUI is told everything, so a dropped packet, a GUI that
+     * reconnects, a GUI started late, or a guest that changed during a
+     * disconnect all correct themselves within one interval without a single
+     * line of code handling any of those cases. The fingerprint needed a
+     * special case for the disconnected state on its own.
+     *
+     * It costs a few hundred bytes every couple of seconds, at QoS 0. QoS 2
+     * here would be a four-part handshake -- roughly 580ms of round trips on
+     * the board's ~145ms link to the broker -- to guarantee delivery of a list
+     * that is about to be sent again anyway. Losing one is free; the next one
+     * supersedes it. Replies to list/start/kill stay at QoS 2, because a
+     * dropped reply to something the user clicked is not self-correcting.
+     *
+     * Not folded into the heartbeat, though it beats twice as often: the data
+     * only changes at this cadence, so half those sends would be identical
+     * bytes, and the beat's payload would then depend on guests_lock -- which
+     * would quietly make "is the board alive?" hostage to anyone who later
+     * holds that lock too long.
+     */
     while (running) {
         hms_mqtt_ensure_connected(&mqtt);
         refresh();
-
-        if (!hms_mqtt_connected(&mqtt)) {
-            /* Publishing would be dropped on the floor. Forget the fingerprint
-               so the first cycle after reconnecting sends the current list
-               rather than staying quiet because nothing changed while we were
-               away -- a GUI that reconnects to silence shows an empty page. */
-            fp_prev[0] = '\0';
-        } else {
-            guests_fingerprint(fp_now, sizeof(fp_now));
-            if (strcmp(fp_now, fp_prev) != 0) {
-                snprintf(fp_prev, sizeof(fp_prev), "%s", fp_now);
-                publish_guest_list();
-            }
-        }
+        publish_guest_list_qos(HMS_MQTT_QOS_BEAT);
 
         for (int i = 0; i < interval_s * 10 && running; i++) {
             /* nanosleep, not usleep: usleep was removed from POSIX.1-2008 and

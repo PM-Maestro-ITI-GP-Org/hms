@@ -348,12 +348,12 @@ void hms_mqtt_disconnect(hms_mqtt_t *m)
     }
 }
 
-int hms_mqtt_publish(hms_mqtt_t *m, const char *topic, const char *payload)
+int hms_mqtt_publish_qos(hms_mqtt_t *m, const char *topic, const char *payload,
+                         int qos)
 {
     if (!m->mosq || !m->connected) return -1;
     size_t len = strlen(payload);
-    int rc = mosquitto_publish(m->mosq, NULL, topic, len, payload,
-                               HMS_MQTT_QOS, false);
+    int rc = mosquitto_publish(m->mosq, NULL, topic, len, payload, qos, false);
     if (rc != MOSQ_ERR_SUCCESS) {
         fprintf(stderr, "[MQTT] publish to %s failed: %s\n",
                 topic, mosquitto_strerror(rc));
@@ -362,9 +362,19 @@ int hms_mqtt_publish(hms_mqtt_t *m, const char *topic, const char *payload)
     return 0;
 }
 
+int hms_mqtt_publish(hms_mqtt_t *m, const char *topic, const char *payload)
+{
+    return hms_mqtt_publish_qos(m, topic, payload, HMS_MQTT_QOS);
+}
+
 int hms_mqtt_publish_status(hms_mqtt_t *m, const char *payload)
 {
     return hms_mqtt_publish(m, HMS_STATUS_TOPIC, payload);
+}
+
+int hms_mqtt_publish_status_qos(hms_mqtt_t *m, const char *payload, int qos)
+{
+    return hms_mqtt_publish_qos(m, HMS_STATUS_TOPIC, payload, qos);
 }
 
 bool hms_mqtt_connected(const hms_mqtt_t *m)
