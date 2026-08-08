@@ -997,6 +997,10 @@ int main(int argc, char **argv)
     }
     hms_mqtt_connect(&mqtt);
 
+    /* Started here rather than on connect, so it exists across reconnects too
+       -- it publishes only while connected and idles the rest of the time. */
+    hms_mqtt_start_heartbeat(&mqtt);
+
     /* refresh_interval was read from hms.conf, stored, and then never looked
        at: the loop slept a hardcoded 2 s, so setting it did nothing. */
     int interval_s = cfg.refresh_interval_s > 0 ? cfg.refresh_interval_s : 2;
