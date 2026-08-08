@@ -10,6 +10,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* Strip leading whitespace and trailing newline in-place. */
 static char *trim_line(char *line)
@@ -526,6 +532,60 @@ static void unreachable_forget(const char *id)
             unreach_log[i][0] = '\0';
 }
 
+/*
+ * Is anything accepting connections on the guest's ssh port?
+ *
+ * This is what "reachable" has to mean, and a bare TCP connect answers it in
+ * about a millisecond.
+ *
+ * The probe used to be `uname -n` over ssh. Measured on the board, one ssh to
+ * a guest costs 5-6 SECONDS -- banner 1.7s, key exchange 0.8s, auth 0.8s, and
+ * two process spawns at ~150ms each, because everything inside the guest runs
+ * 10-30x slower than the same binaries on the host. Spending a full key
+ * exchange to learn one bit, on a timer, meant HMS was mostly waiting for its
+ * own liveness probes and every command the user issued queued behind them.
+ *
+ * A connect() also answers the question more honestly: sshd listening is
+ * exactly the condition that makes exec/shell/scp work.
+ */
+static int port_open(const char *ip, int port, int timeout_ms)
+{
+    if (!ip || !ip[0] || port <= 0) return 0;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((unsigned short)port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) { close(fd); return 0; }
+
+    /* Non-blocking, so an unreachable address costs the timeout below rather
+       than the kernel's own multi-second SYN retry schedule. */
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    int ok = 0;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        ok = 1;                       /* connected immediately (loopback-ish) */
+    } else if (errno == EINPROGRESS) {
+        fd_set wfd;
+        FD_ZERO(&wfd);
+        FD_SET(fd, &wfd);
+        struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+        if (select(fd + 1, NULL, &wfd, NULL, &tv) > 0) {
+            int err = 0;
+            socklen_t elen = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == 0)
+                ok = 1;
+        }
+    }
+
+    close(fd);
+    return ok;
+}
+
 void refresh_guest_name(Guest *g)
 {
     const char *cached = name_cache_get(g->id);
@@ -540,35 +600,63 @@ void refresh_guest_name(Guest *g)
         return;
     }
 
-    /* Already fetched in a previous cycle: restore from the cache. */
-    if (cached) {
-        strncpy(g->name, cached, sizeof(g->name) - 1);
-        g->name[sizeof(g->name) - 1] = '\0';
+    /*
+     * Checked every cycle, even when the name is already known.
+     *
+     * The name used to be the whole story: once fetched it was served from the
+     * cache forever, and since `reachable` is derived from it, a guest that had
+     * answered once was reported reachable until its qvm exited -- through an
+     * sshd crash, a network change, or the guest wedging. The GUI then offered
+     * a shell that could not connect. A connect() is cheap enough to just ask,
+     * every time, so the answer is current rather than remembered.
+     */
+    if (!port_open(g->ip, g->ssh_port > 0 ? g->ssh_port : 22, 400)) {
+        if (cached)
+            name_cache_put(g->id, NULL);   /* it is not reachable any more */
+        if (!unreachable_announced(g->id)) {
+            printf("  [hms] guest '%s' is up but sshd is not accepting yet "
+                   "(%s:%d)\n", g->id, g->ip, g->ssh_port > 0 ? g->ssh_port : 22);
+        }
+        g->name[0] = '\0';
         return;
     }
 
-    /* Throttle SSH attempts: one per 10 s while unreachable. */
+    /* Reachable. If the name is already known, that is all we needed. */
+    if (cached) {
+        strncpy(g->name, cached, sizeof(g->name) - 1);
+        g->name[sizeof(g->name) - 1] = '\0';
+        unreachable_forget(g->id);
+        return;
+    }
+
+    /*
+     * Fetch the hostname exactly once per boot, now that we know sshd is up.
+     *
+     * `uname -n` rather than `hostname`: the guest images carry the same toybox
+     * as the host, and it has no hostname applet, so this always came back
+     * empty and every guest showed its name as "-".
+     *
+     * Still throttled: sshd accepting does not guarantee it will complete a
+     * handshake (that is the 5-6s path), so a guest that accepts but stalls
+     * must not be retried every cycle.
+     */
     time_t now = time(NULL);
     if (now - g->name_ts < 10)
         return;
     g->name_ts = now;
 
-    /* `uname -n` rather than `hostname`: the guest images carry the same
-       toybox as the host, and it has no hostname applet, so this fetch always
-       came back empty and every guest showed its name as "-".
-
-       This doubles as the reachability probe, so it runs every cycle for a
-       guest that is up but not answering -- which is the normal state for the
-       thirty-odd seconds a guest takes to boot. Passing errbuf keeps
-       ssh_exec_diag quiet; the transition is logged once, below, instead of
-       the failure being logged every time. */
     char why[512];
     char *out = ssh_exec_diag(g, "uname -n", why, sizeof(why));
     if (!out) {
         if (!unreachable_announced(g->id)) {
-            printf("  [hms] guest '%s' is up but not answering ssh yet (%s)\n",
-                   g->id, why[0] ? why : "no reason given");
+            printf("  [hms] guest '%s' accepts on :%d but the ssh handshake "
+                   "did not complete (%s)\n",
+                   g->id, g->ssh_port > 0 ? g->ssh_port : 22,
+                   why[0] ? why : "no reason given");
         }
+        /* Reachable enough to report as up: the port is open, so the shell and
+           exec paths are worth offering even if this probe did not finish. */
+        snprintf(g->name, sizeof(g->name), "%s", g->id);
         return;
     }
 
