@@ -654,9 +654,25 @@ void refresh_guest_name(Guest *g)
                    g->id, g->ssh_port > 0 ? g->ssh_port : 22,
                    why[0] ? why : "no reason given");
         }
-        /* Reachable enough to report as up: the port is open, so the shell and
-           exec paths are worth offering even if this probe did not finish. */
+        /*
+         * Fall back to the guest's own id, and CACHE it, so this is not
+         * attempted again until the guest restarts.
+         *
+         * Not caching it was an own goal. The fallback filled in g->name for
+         * display but left the cache empty, so the next cycle saw no cached
+         * name and tried again -- one ssh every 10s, each holding one of the
+         * two gate slots for up to its full 45s timeout, forever. That is what
+         * starved `stats`: the bundle takes ~21s on its own, which fits the
+         * budget comfortably, but not while a hostname probe that will never
+         * succeed is permanently occupying half the gate. The Monitor page then
+         * reported "no response within 45s" for a guest that was fine.
+         *
+         * Losing the real hostname is a fair trade: it is cosmetic, the id is a
+         * perfectly good label, and the entry is evicted when the guest stops,
+         * so a restart gets one more chance at the real thing.
+         */
         snprintf(g->name, sizeof(g->name), "%s", g->id);
+        name_cache_put(g->id, g->name);
         return;
     }
 
