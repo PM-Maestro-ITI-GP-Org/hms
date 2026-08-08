@@ -468,9 +468,19 @@ static void cmd_stats(const char *id)
         if (guest_out) {
             escape_json(guest_out, guest_esc, 262144);
             free(guest_out);
-        } else {
-            running = 0;
         }
+        /*
+         * A failed stats fetch used to clear `running`, so the Monitor page
+         * showed a red "stopped" badge for a guest that qvm says is very much
+         * alive and that the Guests tab was listing as running at the same
+         * moment. Two different questions were being answered with one field:
+         * "is this guest running" (which qvm knows, locally and reliably) and
+         * "could we collect stats from it" (which needs ssh and, on a guest
+         * where a handshake alone costs 5-6s, fails often enough to matter).
+         *
+         * `running` now only ever reflects the first. guest_error carries the
+         * second, and the GUI already prints it under the empty panel.
+         */
     }
 
     char err_esc[1024];

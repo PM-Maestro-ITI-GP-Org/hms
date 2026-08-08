@@ -52,13 +52,28 @@ static int have_timeout(void) { static int c = -1; return have_cmd("timeout", &c
  * command workers each call through here, every one of them ended up stuck in
  * popen() and HMS stopped answering MQTT entirely while still looking alive.
  *
- * 20s: longer than any command HMS issues (the slowest is the stats bundle),
- * and shorter than the GUI's own 15s command timeout is useful beyond.
+ * 45s, raised from 20s after measuring the guest on real hardware.
+ *
+ * 20s was picked when an ssh to a guest was assumed to cost about as much as
+ * one to the host. It does not: a single handshake to guest-1 takes 5-6s on
+ * its own (banner 1.7s, key exchange 0.8s, auth 0.8s, and process spawns at
+ * ~150ms each, because everything inside the guest runs 10-30x slower than the
+ * same binaries on the host). The stats bundle then has to run on top of that,
+ * and with two ssh children allowed in flight they contend. The result was the
+ * Monitor page reporting
+ *
+ *     no response within 20s (ssh was killed)
+ *
+ * for a guest that was perfectly healthy -- the cap was firing on slow, not on
+ * stuck, which is the one thing a watchdog must not do.
+ *
+ * Still bounded, and that still matters: this is what stops a genuinely hung
+ * ssh from pinning a worker and, through them, the whole daemon.
  *
  * ponytail: fixed cap for every exec; make it a per-call argument if a
  * legitimately long-running `exec` from the shell ever needs more.
  */
-#define SSH_EXEC_TIMEOUT "20"
+#define SSH_EXEC_TIMEOUT "45"
 
 /*
  * How many ssh/scp children may be in flight at once, across the whole daemon.
