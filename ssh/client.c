@@ -60,6 +60,57 @@ static int have_timeout(void) { static int c = -1; return have_cmd("timeout", &c
  */
 #define SSH_EXEC_TIMEOUT "20"
 
+/*
+ * How many ssh/scp children may be in flight at once, across the whole daemon.
+ *
+ * Measured on the board, not guessed. A single ssh handshake to guest-1 costs
+ * ~1.9s, nearly all of it key-exchange CPU, and the guest is configured with
+ * one vCPU (a bare `cpu` line in its .qvmconf). Driven one at a time it is
+ * perfectly reliable -- 30 connections, 30 successes. Two at a time: also
+ * clean. Three or more: *every* one fails, because the handshakes queue behind
+ * each other on that one vCPU until they exceed ssh's own ConnectTimeout, and
+ * ssh reports that as
+ *
+ *     Connection timed out during banner exchange
+ *
+ * which reads like a network fault and is not one. The same test run against
+ * the host's own sshd from a Linux box passes 12-for-12, so neither sshd nor
+ * the virtual link is the problem -- only the number of handshakes in flight.
+ *
+ * HMS generates exactly that load by design: four command workers plus the
+ * refresh loop, all calling through this file. Without this gate the daemon is
+ * its own denial of service, and it looks like flaky networking.
+ *
+ * The interactive shell in shell.c is deliberately NOT gated: it is a
+ * long-lived session, and holding a slot for its whole life would starve the
+ * refresh loop.
+ *
+ * ponytail: one global limit. Make it per-guest if guests ever differ enough
+ * in vCPU count for a shared number to be wrong for both.
+ */
+#define SSH_MAX_INFLIGHT 2
+
+static pthread_mutex_t ssh_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  ssh_gate_cv   = PTHREAD_COND_INITIALIZER;
+static int             ssh_inflight;
+
+static void ssh_gate_enter(void)
+{
+    pthread_mutex_lock(&ssh_gate_lock);
+    while (ssh_inflight >= SSH_MAX_INFLIGHT)
+        pthread_cond_wait(&ssh_gate_cv, &ssh_gate_lock);
+    ssh_inflight++;
+    pthread_mutex_unlock(&ssh_gate_lock);
+}
+
+static void ssh_gate_leave(void)
+{
+    pthread_mutex_lock(&ssh_gate_lock);
+    if (ssh_inflight > 0) ssh_inflight--;
+    pthread_cond_signal(&ssh_gate_cv);
+    pthread_mutex_unlock(&ssh_gate_lock);
+}
+
 /* Check if a file exists */
 static int file_exists(const char *path)
 {
@@ -87,7 +138,14 @@ void ssh_build_opts(const Guest *g, char *opts, size_t sz, int for_scp)
          * change after, without ever prompting. */
         "-o StrictHostKeyChecking=accept-new "
         "-o LogLevel=ERROR "
-        "-o ConnectTimeout=5 "
+        /* 15, not 5. ConnectTimeout also bounds the banner exchange, and a
+           handshake to a single-vCPU guest measures ~1.9s on its own -- two of
+           them gated together land near 4s, which leaves almost nothing before
+           a 5s limit fires and reports a healthy guest as unreachable. The real
+           runaway case is caught by SSH_EXEC_TIMEOUT below, which kills the
+           child outright; this only has to be generous enough not to trip on a
+           slow-but-working handshake. */
+        "-o ConnectTimeout=15 "
         "%s %d",
         for_scp ? "-P" : "-p",
         g->ssh_port);
@@ -149,8 +207,10 @@ int ssh_scp_to(const Guest *g, const char *local_path, const char *remote_path,
 
     printf("  [ssh] push %s -> %s@%s:%s\n", local_path, g->ssh_user, g->ip, remote_path);
     printf("  [ssh] push cmd: %s\n", cmd);
+    ssh_gate_enter();
     FILE *fp = popen(cmd, "r");
     if (!fp) {
+        ssh_gate_leave();
         printf("  [ssh] ERROR: popen failed\n");
         if (errbuf) snprintf(errbuf, errbuf_sz, "popen failed");
         return -1;
@@ -169,6 +229,7 @@ int ssh_scp_to(const Guest *g, const char *local_path, const char *remote_path,
         }
     }
     (void)pclose(fp);
+    ssh_gate_leave();
 
     /* QNX pclose() reports -1 even when the child exited 0, so its return
        value cannot be trusted. Judge success by the captured output (a real
@@ -305,8 +366,10 @@ char *ssh_exec_diag(const Guest *g, const char *command,
         return NULL;
     }
 
+    ssh_gate_enter();
     FILE *fp = popen(cmd, "r");
     if (!fp) {
+        ssh_gate_leave();
         printf("  [ssh] ERROR: popen failed\n");
         if (errbuf) snprintf(errbuf, errbuf_sz, "popen failed");
         remove(errfile);
@@ -315,7 +378,7 @@ char *ssh_exec_diag(const Guest *g, const char *command,
 
     size_t cap = 4096, len = 0;
     char *out = malloc(cap);
-    if (!out) { pclose(fp); remove(errfile); return NULL; }
+    if (!out) { pclose(fp); ssh_gate_leave(); remove(errfile); return NULL; }
     out[0] = '\0';
 
     char buf[1024];
@@ -324,13 +387,14 @@ char *ssh_exec_diag(const Guest *g, const char *command,
         if (len + blen + 1 > cap) {
             cap *= 2;
             char *tmp = realloc(out, cap);
-            if (!tmp) { free(out); pclose(fp); remove(errfile); return NULL; }
+            if (!tmp) { free(out); pclose(fp); ssh_gate_leave(); remove(errfile); return NULL; }
             out = tmp;
         }
         memcpy(out + len, buf, blen + 1);
         len += blen;
     }
     (void)pclose(fp);
+    ssh_gate_leave();
 
     /* Read back whatever ssh complained about. */
     char err[512] = "";
