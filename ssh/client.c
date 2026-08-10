@@ -79,8 +79,8 @@ static int have_timeout(void) { static int c = -1; return have_cmd("timeout", &c
  * How many ssh/scp children may be in flight at once, across the whole daemon.
  *
  * Measured on the board, not guessed. A single ssh handshake to guest-1 costs
- * ~1.9s, nearly all of it key-exchange CPU, and the guest is configured with
- * one vCPU (a bare `cpu` line in its .qvmconf). Driven one at a time it is
+ * ~1.9s, nearly all of it key-exchange CPU, and at the time of measuring the
+ * guest had one vCPU (a bare `cpu` line in its .qvmconf). Driven one at a time it is
  * perfectly reliable -- 30 connections, 30 successes. Two at a time: also
  * clean. Three or more: *every* one fails, because the handshakes queue behind
  * each other on that one vCPU until they exceed ssh's own ConnectTimeout, and
@@ -99,6 +99,23 @@ static int have_timeout(void) { static int c = -1; return have_cmd("timeout", &c
  * The interactive shell in shell.c is deliberately NOT gated: it is a
  * long-lived session, and holding a slot for its whole life would starve the
  * refresh loop.
+ *
+ * The premise has since changed and this number has NOT been re-measured. The
+ * QNX guest now has two vCPUs, with the second at host priority 20 (see
+ * meta-qnx-guest/docs/vcpus.md), so the serialisation that made three
+ * concurrent handshakes fail is weaker than when 2 was chosen. Raising it is
+ * plausible and unverified; leaving a measured number alone beats replacing it
+ * with a guess, and being too conservative here costs latency rather than
+ * correctness.
+ *
+ * It is worth knowing which way this cuts. Everything in this file is bounded
+ * by how fast the guest can do key-exchange CPU, so the Monitor tab -- which
+ * SSHes into the guest on every poll -- is the first thing to break when the
+ * guest is starved, and it breaks as
+ *
+ *     Connection timed out during banner exchange
+ *
+ * which reads like a network fault and is a scheduling one.
  *
  * ponytail: one global limit. Make it per-guest if guests ever differ enough
  * in vCPU count for a shared number to be wrong for both.
