@@ -429,6 +429,69 @@ static char *run_local(const char *command)
     return out;
 }
 
+/*
+ * How long a guest that failed a stats fetch is left alone, and how long any
+ * one attempt may take.
+ *
+ * Without the cool-off, every poll paid the timeout again: the GUI asks every
+ * 15s, each attempt sat there until the cap, and the reply -- host half
+ * included -- arrived that late every single time. The page looked frozen
+ * even though the host statistics beside it were a couple of seconds old and
+ * sitting in memory ready to send.
+ *
+ * So a failure is remembered. The host half goes out immediately, the guest
+ * half says why it is missing, and the guest is retried once the cool-off
+ * expires rather than on every poll in between.
+ *
+ * 12s rather than the interactive 45s: the GUI asks again in 15s, so a guest
+ * that has not answered in twelve has nothing worth waiting for.
+ */
+#define STATS_SSH_TIMEOUT   "12"
+#define STATS_COOLOFF_SEC   60
+
+static struct {
+    char   id[GUEST_ID_LEN];
+    time_t until;
+} stats_skip[MAX_GUESTS];
+
+static pthread_mutex_t stats_skip_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Seconds still to wait before this guest is worth trying again, or 0. */
+static int stats_cooloff_left(const char *id)
+{
+    int left = 0;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&stats_skip_lock);
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (stats_skip[i].id[0] && strcmp(stats_skip[i].id, id) == 0) {
+            if (stats_skip[i].until > now) left = (int)(stats_skip[i].until - now);
+            break;
+        }
+    pthread_mutex_unlock(&stats_skip_lock);
+    return left;
+}
+
+/* secs > 0 starts a cool-off; 0 clears one after a guest answers. */
+static void stats_cooloff_set(const char *id, int secs)
+{
+    time_t until = secs > 0 ? time(NULL) + secs : 0;
+    pthread_mutex_lock(&stats_skip_lock);
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (stats_skip[i].id[0] && strcmp(stats_skip[i].id, id) == 0) {
+            stats_skip[i].until = until;
+            pthread_mutex_unlock(&stats_skip_lock);
+            return;
+        }
+    if (secs > 0)
+        for (int i = 0; i < MAX_GUESTS; i++)
+            if (!stats_skip[i].id[0]) {
+                snprintf(stats_skip[i].id, sizeof(stats_skip[i].id), "%s", id);
+                stats_skip[i].until = until;
+                break;
+            }
+    pthread_mutex_unlock(&stats_skip_lock);
+}
+
 static void cmd_stats(const char *id)
 {
     int running = 0;
@@ -464,10 +527,25 @@ static void cmd_stats(const char *id)
        indistinguishable from the guest being stopped. */
     char guest_err[512] = "";
     if (running) {
-        char *guest_out = ssh_exec_diag(&g, STATS_CMD, guest_err, sizeof(guest_err));
+        int left = stats_cooloff_left(guest_id);
+        if (left > 0) {
+            /* Answer now with what we have. Paying the timeout again would
+               delay the host half too, for a guest already known to be
+               unwell. */
+            snprintf(guest_err, sizeof(guest_err),
+                     "guest did not answer; not retried for another %ds", left);
+        } else {
+        char *guest_out = ssh_exec_timeout(&g, STATS_CMD, guest_err,
+                                           sizeof(guest_err), STATS_SSH_TIMEOUT);
         if (guest_out) {
             escape_json(guest_out, guest_esc, 262144);
             free(guest_out);
+            stats_cooloff_set(guest_id, 0);      /* it answered */
+        } else {
+            stats_cooloff_set(guest_id, STATS_COOLOFF_SEC);
+            printf("  [hms] guest '%s' stats failed (%s); skipping it for %ds\n",
+                   guest_id, guest_err, STATS_COOLOFF_SEC);
+        }
         }
         /*
          * A failed stats fetch used to clear `running`, so the Monitor page

@@ -392,6 +392,9 @@ static void tmp_name(char *out, size_t sz, const char *tag)
     snprintf(out, sz, "/tmp/hms_%s_%d_%u", tag, (int)getpid(), mine);
 }
 
+/* The cap for the current call. Set by ssh_exec_timeout(), reset after. */
+static const char *exec_timeout = SSH_EXEC_TIMEOUT;
+
 char *ssh_exec_diag(const Guest *g, const char *command,
                     char *errbuf, size_t errbuf_sz)
 {
@@ -426,7 +429,12 @@ char *ssh_exec_diag(const Guest *g, const char *command,
     tmp_name(errfile, sizeof(errfile), "ssherr");
 
     /* -k 5: SIGTERM at the cap, SIGKILL five seconds later if ssh ignores it. */
-    const char *tmo = have_timeout() ? "timeout -k 5 " SSH_EXEC_TIMEOUT " " : "";
+    char tmobuf[64];
+    const char *tmo = "";
+    if (have_timeout()) {
+        snprintf(tmobuf, sizeof(tmobuf), "timeout -k 5 %s ", exec_timeout);
+        tmo = tmobuf;
+    }
 
     /* The exit status, via a file. QNX's pclose() returns -1 even for a child
        that exited 0, so it cannot be used -- and without the status a command
@@ -519,9 +527,9 @@ char *ssh_exec_diag(const Guest *g, const char *command,
        as reachable and hide the very failure the cap exists to surface. */
     if (rc == 124) {
         snprintf(err, sizeof(err),
-                 "no response within %ss (ssh was killed)", SSH_EXEC_TIMEOUT);
+                 "no response within %ss (ssh was killed)", exec_timeout);
         printf("  [ssh] '%s' on %s timed out after %ss\n",
-               command, g->id, SSH_EXEC_TIMEOUT);
+               command, g->id, exec_timeout);
         if (errbuf) snprintf(errbuf, errbuf_sz, "%s", err);
         free(out);
         return NULL;
@@ -564,6 +572,25 @@ char *ssh_exec_diag(const Guest *g, const char *command,
     if (err[0] && errbuf)
         snprintf(errbuf, errbuf_sz, "%s", err);
 
+    return out;
+}
+
+/*
+ * Same as ssh_exec_diag, with a caller-chosen cap.
+ *
+ * Stats do not want the 45s one. That cap exists for an interactive `exec`
+ * from the Remote Shell, where a long-running command is legitimate. A
+ * statistics poll is the opposite: the GUI asks again in 15s, so a guest that
+ * has not answered in a few seconds has nothing worth waiting for -- and
+ * waiting is what made the whole Monitor page, host half included, arrive 45s
+ * late whenever the guest was unwell.
+ */
+char *ssh_exec_timeout(const Guest *g, const char *command,
+                       char *errbuf, size_t errbuf_sz, const char *secs)
+{
+    exec_timeout = secs;
+    char *out = ssh_exec_diag(g, command, errbuf, errbuf_sz);
+    exec_timeout = SSH_EXEC_TIMEOUT;
     return out;
 }
 

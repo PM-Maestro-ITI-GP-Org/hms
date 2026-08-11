@@ -23,6 +23,11 @@ char *ssh_exec(const Guest *g, const char *command);
  * stderr is captured separately from stdout on purpose: callers parse stdout,
  * so merging the two would corrupt it.
  */
+/* ssh_exec_diag with a caller-chosen wall-clock cap, in seconds as a string.
+   Used by the stats poll, which must not wait the full interactive cap. */
+char *ssh_exec_timeout(const Guest *g, const char *command,
+                       char *errbuf, size_t errbuf_sz, const char *secs);
+
 char *ssh_exec_diag(const Guest *g, const char *command,
                     char *errbuf, size_t errbuf_sz);
 
