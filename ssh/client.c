@@ -178,6 +178,33 @@ void ssh_build_opts(const Guest *g, char *opts, size_t sz, int for_scp)
            child outright; this only has to be generous enough not to trip on a
            slow-but-working handshake. */
         "-o ConnectTimeout=15 "
+        /*
+         * Connection multiplexing, and it is the difference between the
+         * Monitor page working and not.
+         *
+         * Every ssh here paid for a full key exchange, and key exchange is CPU
+         * *inside the guest*. On an idle single-vCPU guest that measured ~1.9s
+         * (see SSH_MAX_INFLIGHT above). On a guest running the cluster demo --
+         * software-rendered Qt plus three motor apps -- it stopped completing
+         * at all: every command, `echo hi` included, ran into the 45s cap:
+         *
+         *     exec guest-1 "echo hi"  ->  no response within 45s (ssh was killed)
+         *
+         * The Monitor polls this path continuously, so it was the first thing
+         * to die and the loudest about it.
+         *
+         * With a master connection the handshake happens once and every
+         * command after it opens a channel on the existing session -- no KEX,
+         * no auth, no per-poll CPU in a guest that has none to spare.
+         *
+         * ControlPersist is deliberately short. A master that wedges takes
+         * every command behind it down with it, so it is better for one to
+         * expire and be rebuilt than to linger: 30s still covers a 15s poll
+         * interval, which is the case that matters.
+         */
+        "-o ControlMaster=auto "
+        "-o ControlPath=/tmp/hms-%%r@%%h:%%p "
+        "-o ControlPersist=30 "
         "%s %d",
         for_scp ? "-P" : "-p",
         g->ssh_port);
