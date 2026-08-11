@@ -909,10 +909,11 @@ static struct {
     char            items[CMD_QUEUE_MAX][2048];
     int             head, tail, count;
     int             stats_running;   /* see the coalescing note below */
+    char            stats_target[GUEST_ID_LEN];  /* which guest it is about */
     pthread_mutex_t lock;
     pthread_cond_t  cv;
 } cmdq = {
-    .head = 0, .tail = 0, .count = 0, .stats_running = 0,
+    .head = 0, .tail = 0, .count = 0, .stats_running = 0, .stats_target = "",
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cv   = PTHREAD_COND_INITIALIZER,
 };
@@ -920,6 +921,14 @@ static struct {
 static int is_stats_cmd(const char *c)
 {
     return strncmp(c, "stats", 5) == 0 && (c[5] == '\0' || c[5] == ' ');
+}
+
+/* The guest a stats command asks about; "" for the host on its own. */
+static void stats_target_of(const char *cmd, char *out, size_t sz)
+{
+    const char *p = cmd + 5;                 /* past "stats" */
+    while (*p == ' ' || *p == '\t') p++;
+    snprintf(out, sz, "%s", p);
 }
 
 static void *cmd_worker(void *arg)
@@ -939,13 +948,21 @@ static void *cmd_worker(void *arg)
         cmdq.head = (cmdq.head + 1) % CMD_QUEUE_MAX;
         cmdq.count--;
         int mine_is_stats = is_stats_cmd(cmd);
+        char mine_target[GUEST_ID_LEN] = "";
+        if (mine_is_stats)
+            stats_target_of(cmd, mine_target, sizeof(mine_target));
         pthread_mutex_unlock(&cmdq.lock);
 
         dispatch_command(cmd);
 
         if (mine_is_stats) {
             pthread_mutex_lock(&cmdq.lock);
-            cmdq.stats_running = 0;
+            /* Only if the in-flight target is still ours. A stats for a
+               DIFFERENT guest admitted while this one ran has taken the slot
+               and named itself in stats_target; clearing the flag here would
+               release a slot that is not ours and let a third request in. */
+            if (strcmp(cmdq.stats_target, mine_target) == 0)
+                cmdq.stats_running = 0;
             pthread_mutex_unlock(&cmdq.lock);
         }
     }
@@ -988,11 +1005,36 @@ static void handle_command(void *userdata, const char *cmd)
     }
 
     if (is_stats_cmd(cmd)) {
-        if (cmdq.stats_running) {
+        char target[GUEST_ID_LEN];
+        stats_target_of(cmd, target, sizeof(target));
+
+        /*
+         * Coalesce only a REPEAT of the question already being answered.
+         *
+         * It used to coalesce on "is any stats running", which silently threw
+         * away the one request that matters most: the one sent the instant the
+         * user changes what they are looking at. The GUI's Monitor page
+         * requests immediately on a selection change, so switching from guest-1
+         * to host-only while a guest poll was in flight dropped the host
+         * request outright -- and the page then sat on "Fetching..." with its
+         * Refresh button disabled until its own 60s watchdog fired.
+         *
+         * The asymmetry that made it look arbitrary: a guest poll SSHes into
+         * the guest and takes ~21s, so switching away from a guest almost
+         * always lands inside that window. A host-only poll is local and
+         * sub-second, so switching the other way almost never does. Same bug,
+         * one direction hit constantly and the other effectively never.
+         *
+         * A repeat for the same target really is redundant -- it asks a
+         * question that is about to be answered -- so that one is still
+         * dropped, which is what keeps a polling GUI from backing HMS up.
+         */
+        if (cmdq.stats_running && strcmp(cmdq.stats_target, target) == 0) {
             pthread_mutex_unlock(&cmdq.lock);
             return;
         }
         cmdq.stats_running = 1;
+        snprintf(cmdq.stats_target, sizeof(cmdq.stats_target), "%s", target);
     }
 
     snprintf(cmdq.items[cmdq.tail], sizeof(cmdq.items[0]), "%s", cmd);
