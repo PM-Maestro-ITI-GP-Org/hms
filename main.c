@@ -260,9 +260,32 @@ static void cmd_start(const char *id, const char *ip)
         guest_set_ip(&g);
     }
     int rc = guest_start(&g);
-    refresh();
+
+    /*
+     * Say so IMMEDIATELY, then refresh.
+     *
+     * This used to refresh() first, and refresh() fetches each guest's
+     * hostname over ssh -- into a guest launched a second earlier, whose sshd
+     * cannot possibly be listening yet. So the one moment the GUI most needs
+     * an answer was the one moment hms was guaranteed to spend the full ssh
+     * timeout not producing one, per guest. The button sat on "starting" until
+     * that finished and the list finally went out, long after the guest was up
+     * and its applications running.
+     *
+     * set_guest_state records the transition the operation just made, which is
+     * the authoritative thing here: we launched it, so we know. The discoverer
+     * fills in the real pid on the next cycle, and the periodic list carries
+     * the hostname once the guest is actually answering.
+     */
+    if (rc == 0)
+        set_guest_state(id, GUEST_RUNNING, 0);
+
     publish_result("start", id, rc == 0,
                    rc == 0 ? "guest started" : "failed to start guest");
+    publish_guest_list();
+
+    /* Now the slow part, with nobody waiting on it. */
+    refresh();
     publish_guest_list();
 }
 
@@ -272,9 +295,18 @@ static void cmd_kill(const char *id)
     if (!find_guest_or_publish("kill", id, &g)) return;
 
     int rc = guest_kill(&g);
-    refresh();
+
+    /* Same reasoning as cmd_start: report the transition we just made before
+       doing anything that can block, so the GUI never waits on ssh to learn
+       the result of a local operation. */
+    if (rc == 0)
+        set_guest_state(id, GUEST_STOPPED, 0);
+
     publish_result("kill", id, rc == 0,
                    rc == 0 ? "guest killed" : "failed to kill guest");
+    publish_guest_list();
+
+    refresh();
     publish_guest_list();
 }
 

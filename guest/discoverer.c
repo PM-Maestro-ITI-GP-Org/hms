@@ -646,7 +646,12 @@ void refresh_guest_name(Guest *g)
     g->name_ts = now;
 
     char why[512];
-    char *out = ssh_exec_diag(g, "uname -n", why, sizeof(why));
+    /* 10s, not the 45s interactive cap. This runs inside refresh(), which the
+       periodic loop and every command path calls, so whatever it waits for is
+       added to how long the GUI waits to hear anything at all. `uname -n` on a
+       healthy guest is instant; a guest that needs longer than ten seconds to
+       produce it is one whose name we can do without. */
+    char *out = ssh_exec_timeout(g, "uname -n", why, sizeof(why), "10");
     if (!out) {
         if (!unreachable_announced(g->id)) {
             printf("  [hms] guest '%s' accepts on :%d but the ssh handshake "
