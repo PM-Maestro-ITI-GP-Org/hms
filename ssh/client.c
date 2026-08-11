@@ -149,6 +149,48 @@ static int file_exists(const char *path)
     return (access(path, F_OK) == 0);
 }
 
+/*
+ * The ControlMaster options, or "" when the socket cannot be created.
+ *
+ * NOT /tmp. On this host /tmp is a symlink to /dev/shmem, which is shared
+ * memory and cannot hold a unix domain socket, so every connection failed
+ * outright with
+ *
+ *     unix_listener: cannot bind to path /tmp/hms-root@10.0.0.2:22...:
+ *     No such file or directory
+ *
+ * and the guest half of the Monitor came back empty in two seconds -- fast,
+ * and useless, which is a worse failure than the slow one it replaced.
+ *
+ * /var/run is on the data partition, a real filesystem, and works: measured on
+ * the board, the first call pays the handshake and the second returns in 58ms.
+ *
+ * Checked once and cached, and empty if the directory is missing or read-only.
+ * That is the board whose data partition did not mount, and it must not lose
+ * ssh as well -- without these options every command simply pays its own
+ * handshake, which is exactly the behaviour this replaced.
+ */
+#define SSH_CONTROL_DIR "/var/run"
+
+static const char *control_opts(void)
+{
+    static int checked = 0;
+    static const char *opts = "";
+
+    if (!checked) {
+        checked = 1;
+        if (access(SSH_CONTROL_DIR, W_OK) == 0) {
+            opts = "-o ControlMaster=auto "
+                   "-o ControlPath=" SSH_CONTROL_DIR "/hms-%r@%h:%p "
+                   "-o ControlPersist=30 ";
+        } else {
+            printf("  [ssh] %s is not writable; ssh multiplexing off, every "
+                   "command pays its own handshake\n", SSH_CONTROL_DIR);
+        }
+    }
+    return opts;
+}
+
 /* Build the shared SSH options string (host key handling + port).
    scp uses uppercase -P for the port (lowercase -p means "preserve
    times" and would treat the port number as a local file!). */
@@ -202,10 +244,9 @@ void ssh_build_opts(const Guest *g, char *opts, size_t sz, int for_scp)
          * expire and be rebuilt than to linger: 30s still covers a 15s poll
          * interval, which is the case that matters.
          */
-        "-o ControlMaster=auto "
-        "-o ControlPath=/tmp/hms-%%r@%%h:%%p "
-        "-o ControlPersist=30 "
+        "%s"                     /* multiplexing, when it can be used */
         "%s %d",
+        control_opts(),
         for_scp ? "-P" : "-p",
         g->ssh_port);
     if (n < 0 || (size_t)n >= sz) return;
