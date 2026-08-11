@@ -150,46 +150,36 @@ static int file_exists(const char *path)
 }
 
 /*
- * The ControlMaster options, or "" when the socket cannot be created.
+ * No connection multiplexing. This is a deliberate reversal -- it was added,
+ * measured, and taken back out, and the measurements are worth keeping.
  *
- * NOT /tmp. On this host /tmp is a symlink to /dev/shmem, which is shared
- * memory and cannot hold a unix domain socket, so every connection failed
- * outright with
+ * The idea was sound: a handshake is CPU in the guest, so pay it once. With a
+ * live master a second command returns in 58ms against ~350ms cold. What sank
+ * it is what happens when the master dies.
  *
- *     unix_listener: cannot bind to path /tmp/hms-root@10.0.0.2:22...:
- *     No such file or directory
+ * Every ssh here is wrapped in `timeout -k 5`, which SIGKILLs it. Kill the
+ * process that happens to be the master and the socket file survives it. From
+ * then on ssh finds the socket, cannot reach anything behind it, and pays the
+ * FULL ConnectTimeout before falling back to a direct connection. Measured on
+ * the board, same host, same guest, same moment:
  *
- * and the guest half of the Monitor came back empty in two seconds -- fast,
- * and useless, which is a worse failure than the slow one it replaced.
+ *     through the stale control path   15333 ms
+ *     ControlPath=none                   343 ms
  *
- * /var/run is on the data partition, a real filesystem, and works: measured on
- * the board, the first call pays the handshake and the second returns in 58ms.
+ * and hms's own stats cap is 12s, so it never survived to the fallback:
+ * "no response within 12s (ssh was killed)", on every poll, forever, because
+ * nothing removes the socket. A self-sustaining failure, and worse than the
+ * cost it was introduced to avoid.
  *
- * Checked once and cached, and empty if the directory is missing or read-only.
- * That is the board whose data partition did not mount, and it must not lose
- * ssh as well -- without these options every command simply pays its own
- * handshake, which is exactly the behaviour this replaced.
+ * There is no cheap guard either. `ssh -O check` is the documented way to ask
+ * whether a master is alive, and against a stale socket it hung for over 100s
+ * rather than answering -- so detecting the bad state costs more than the bad
+ * state does.
+ *
+ * 343ms per connection is a price worth paying for a mechanism that cannot
+ * wedge. If this is ever revisited, the master must be started and owned
+ * separately so that no `timeout` can kill it.
  */
-#define SSH_CONTROL_DIR "/var/run"
-
-static const char *control_opts(void)
-{
-    static int checked = 0;
-    static const char *opts = "";
-
-    if (!checked) {
-        checked = 1;
-        if (access(SSH_CONTROL_DIR, W_OK) == 0) {
-            opts = "-o ControlMaster=auto "
-                   "-o ControlPath=" SSH_CONTROL_DIR "/hms-%r@%h:%p "
-                   "-o ControlPersist=30 ";
-        } else {
-            printf("  [ssh] %s is not writable; ssh multiplexing off, every "
-                   "command pays its own handshake\n", SSH_CONTROL_DIR);
-        }
-    }
-    return opts;
-}
 
 /* Build the shared SSH options string (host key handling + port).
    scp uses uppercase -P for the port (lowercase -p means "preserve
@@ -244,9 +234,7 @@ void ssh_build_opts(const Guest *g, char *opts, size_t sz, int for_scp)
          * expire and be rebuilt than to linger: 30s still covers a 15s poll
          * interval, which is the case that matters.
          */
-        "%s"                     /* multiplexing, when it can be used */
         "%s %d",
-        control_opts(),
         for_scp ? "-P" : "-p",
         g->ssh_port);
     if (n < 0 || (size_t)n >= sz) return;
