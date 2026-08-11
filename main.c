@@ -928,7 +928,11 @@ static void stats_target_of(const char *cmd, char *out, size_t sz)
 {
     const char *p = cmd + 5;                 /* past "stats" */
     while (*p == ' ' || *p == '\t') p++;
-    snprintf(out, sz, "%s", p);
+    /* "%.*s", not "%s". The truncation is intended and harmless -- a target
+       longer than a guest id cannot name a real guest -- but a bare %s of a
+       2KB command into 32 bytes is -Wformat-truncation, and a warning nobody
+       can act on is worse than the precision that removes it. */
+    snprintf(out, sz, "%.*s", (int)(sz - 1), p);
 }
 
 static void *cmd_worker(void *arg)
