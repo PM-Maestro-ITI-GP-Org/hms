@@ -45,16 +45,35 @@ GuestType guest_type_from_conf(const char *conf_path) {
 
     char line[256];
     GuestType type = GUEST_UNKNOWN;
+    int has_load = 0;
 
+    /* `load <image>` is not QNX-specific: qvm has one loader for every guest
+       type, and this project's own Linux guest boots via `load image.bin`
+       with no `kernel` directive at all -- linux.qvmconf never sets one, it
+       hands the kernel image to the same `load` line qnx-guest.qvmconf uses
+       for its IFS. Deciding on the first `load` line seen therefore misread
+       every guest with no `kernel`/`bootimg` line as GUEST_QNX, which is
+       exactly what happened to guest-2: correctly booted as Linux, but
+       reported everywhere (type column, default address fallback) as QNX.
+
+       `cmdline` is the fix: it is a Linux kernel command line, which QNX
+       never has (its IFS carries its own boot script), so it is a reliable
+       Linux marker even when `kernel` itself is absent. Scan the whole file
+       for the strong markers first and only fall back to `load` -> QNX at
+       the end, so a `load` line earlier in the file can no longer pre-empt a
+       `cmdline` line that appears later. */
     while (fgets(line, sizeof(line), f)) {
         if (strstr(line, "kernel ") || strstr(line, "kernel="))
             { type = GUEST_LINUX;   break; }
         if (strstr(line, "bootimg ") || strstr(line, "bootimg="))
             { type = GUEST_ANDROID; break; }
-        if (strstr(line, "load ") || strstr(line, "load\t"))
-            { type = GUEST_QNX;     break; }
+        if (strstr(line, "cmdline ") || strstr(line, "cmdline="))
+            { type = GUEST_LINUX;   break; }
+        if (!has_load && (strstr(line, "load ") || strstr(line, "load\t")))
+            has_load = 1;
     }
     fclose(f);
+    if (type == GUEST_UNKNOWN && has_load) type = GUEST_QNX;
     return type;
 }
 
