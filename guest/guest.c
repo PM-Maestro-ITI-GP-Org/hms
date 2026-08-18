@@ -92,9 +92,19 @@ int guest_boot_image(const Guest *g, char *out, size_t sz)
             char *p = line;
             while (*p == ' ' || *p == '\t') p++;
 
-            if (strncmp(p, "load ", 5) == 0) {          /* QNX: load <name>.ifs */
+            if (strncmp(p, "load ", 5) == 0) {
+                /* qvm has one loader for every guest type: QNX names its IFS
+                   here (*.ifs), but this project's own Linux guest boots the
+                   same way -- linux.qvmconf has no `kernel` line at all, just
+                   `load image.bin`. Requiring ".ifs" on the token meant a
+                   Linux guest's `load` line was read and then silently
+                   discarded (falling through to try `kernel`, which never
+                   matches either), so guest_boot_image() reported "not
+                   found" and the boot image never appeared in the guest's
+                   file list at all -- the same misreading `load` as
+                   QNX-specific that guest_type_from_conf() above had. */
                 char *tok = strtok(p + 5, " \t\r\n");
-                if (tok && strstr(tok, ".ifs")) {
+                if (tok && tok[0]) {
                     snprintf(found, sizeof(found), "%s", tok);
                     break;
                 }
