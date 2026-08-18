@@ -86,4 +86,12 @@ const char *guest_meta_conf(const Guest *g);
  */
 int guest_system_name(const Guest *g, char *out, size_t sz);
 
+/*
+ * Read the configured RAM out of the qvmconf's `ram <base>,<size>` directive
+ * (e.g. "ram 0x80000000,4G") as a decimal byte count. The guest kernel's own
+ * reporting understates it (kernel reservation), so this is the size the
+ * Monitor's RAM tile should show. Writes "" when the conf has no `ram` line.
+ */
+void guest_conf_ram(const Guest *g, char *out, size_t sz);
+
 #endif

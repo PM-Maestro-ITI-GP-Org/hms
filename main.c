@@ -421,19 +421,124 @@ static void cmd_exec(const char *id, const char *command)
  * 56 KB -- almost all of it the full per-thread process table -- which after
  * JSON escaping, doubled for host+guest, is close to a megabyte on the wire
  * every poll, for a page that displays a few dozen rows.
+ *
+ * The ###PROC chain used to lead with `top -b -i 1`, which was wrong on both
+ * sides:
+ *
+ *  - On QNX, `-i 1` is "run one iteration" (correct), but QNX top shows only
+ *    its 10 busiest threads unless told otherwise -- `-z` raises it, max 100.
+ *    That is why the Monitor page showed a handful of processes instead of
+ *    the system's process list.
+ *  - On Linux, procps `top -b -i 1` is "batch, hide idle processes, 1s delay"
+ *    -- it loops forever hiding everything idle, so a quiet guest produced a
+ *    nearly empty table and the guest's Monitor tab looked dead.
+ *
+ * So the chain now leads with the portable `top -b -n 1` (batch, one full
+ * frame, every process) for Linux, and QNX's top rejects `-n` and falls
+ * through to its own `top -b -i 1 -z 100`. `ps -o pid,time,comm` is a
+ * fallback for hosts whose top has neither flag set.
+ *
+ * head -40 -> head -400: the QNX table is ~110 lines at -z 100, and a busy
+ * Linux guest prints more than 40 rows, which used to be silently discarded
+ * before it ever reached the GUI.
+  *
+ * Every `head -NNN` is spelled `head -n NNN`. busybox head (the Linux guest's
+ * tool) rejects the GNU shorthand `-400`, so with `head -40` in place EVERY
+ * section of a busybox guest's stats failed -- empty output end to end, and a
+ * Monitor tab with a hostname and nothing else. `-n 400` is POSIX and works
+ * on busybox, toybox and QNX head alike.
+ *
+ * `ps -o pid,time,comm` was dropped: busybox ps rejects `-o` too. The chain
+ * leans on `top -b -n 1` (busybox and procps both accept it).
+ *
+ * The `||` chain itself was the remaining bug, confirmed by running each
+ * candidate directly against the real board over `exec` rather than
+ * guessing from a shell prompt: QNX's `top` does not treat `-n` as a hard
+ * error. It prints its usage banner to stdout ("top - display system
+ * usage (UNIX)" ... "Options:" ...) and still exits 0. `||` only moves on
+ * when the left side's exit status is nonzero, so on QNX the chain stopped
+ * at the very first command every time, captured a page of usage text
+ * instead of a process table, and never once reached `top -b -i 1 -z 10` --
+ * which is why the Monitor page showed only whatever the parser happened to
+ * salvage out of a help screen, not "the top 10 by CPU" as the old -z 10
+ * choice below assumed.
+ *
+ * So each candidate's OUTPUT is checked now, not its exit status: does it
+ * contain COMMAND the way every real process table's header does, and that
+ * QNX's usage banner does not. A candidate that fails silently with exit 0
+ * no longer blocks the ones after it.
+ *
+ * The group is spelled `{ ...; } | head`, not `( ... ) | head`. A parenthesised
+ * group starting right after `;` concatenates into `((` and QNX sh (pdksh
+ * family) reads `((` as an arithmetic expression, so every poll died with
+ * `sh: ...: unexpected '1'` -- nothing reached the GUI. Braces are a plain
+ * group and work identically on QNX sh, busybox ash and procps shells.
+ *
+ * That check is spelled `cmd | grep -q COMMAND && cmd` -- running the
+ * candidate twice rather than capturing it once with `x=$(cmd)` -- because
+ * this whole string is later handed to ssh_exec_diag(), which drops it into
+ * `ssh ... "%s"` for popen(). Both a literal `"` and an unescaped `$(...)`
+ * inside that double-quoted region are interpreted by the LOCAL shell
+ * before ssh ever sees them: a `"` closes the quoting early and corrupts
+ * the argument boundary, and `$(...)` runs top on the HMS host instead of
+ * over ssh on the guest. Confirmed the hard way -- an early version of this
+ * fix used `out="$(cmd)"` and `case "$out" in ...)`, which produced `sh:
+ * syntax error: '(' unexpected` the moment it reached ssh_exec_diag,
+ * because the local shell had already mangled it. Running the candidate
+ * twice costs one extra `top`/`ps` per poll but needs no quoting HMS's own
+ * transport cannot survive.
+ *
+ * And -z 10 was wrong on its own terms. The claim that -z 50 or -z 100
+ * "only returns a header line" does not hold on this board -- run directly,
+ * `-z 100` returns the board's whole thread table (30-odd processes, well
+ * under the 100 cap) same as -z 10 does, just without silently hiding every
+ * process outside the 10 busiest by CPU. That hiding, not a parser bug, was
+ * the other half of "only a couple of processes show up": a quiet process
+ * sitting at 0.0% CPU never made the top 10 and so never appeared at all.
+ *
+ * head -40 -> head -400: the QNX table is well over 100 lines at -z 100,
+ * and a busy Linux guest prints more than 40 rows too, either of which used
+ * to be silently discarded before reaching the GUI.
+ *
+ * ###MEM tries /proc/meminfo before `free -m` now. busybox `free -m` prints
+ * its numbers in kB whatever the flag says, and /proc/meminfo states its
+ * units explicitly ("MemTotal: 4026068 kB"), so the parser gets a number it
+ * can trust.
+ *
+ * ###NAME dumps /proc/PID/comm on Linux (via a plain `grep .` over the glob,
+ * which needs no $() -- that shell construct is forbidden below). busybox
+ * top/ps truncate every thread name to 15 chars ([pool_workqueue_]), which
+ * read as corrupted names; the kernel's comm carries the full name
+ * (pool_workqueue_release). On QNX the glob matches nothing and the section
+ * is empty, which is exactly right.
+ *
+ * The first PROC candidate runs `top -b -n 1` only as a quick probe, then
+ * emits `top -b -n 2 -d 1`: with a single sample busybox top reports %CPU as
+ * 0 for every process (no previous sample to diff against), so the second
+ * sample after 1s is the one with real numbers. The parser merges the two
+ * tables by PID and keeps the max, so the second table's %CPU wins.
  */
 static const char STATS_CMD[] =
     "echo '###HOSTNAME'; uname -n 2>/dev/null;"
     "echo '###KERNEL'; uname -a 2>/dev/null;"
-    "echo '###UPTIMESEC'; (cat /proc/uptime 2>/dev/null || uptime 2>/dev/null) | head -2;"
+    "echo '###UPTIMESEC'; (cat /proc/uptime 2>/dev/null || uptime 2>/dev/null) | head -n 2;"
     "echo '###CPUINFO'; (pidin info 2>/dev/null || cat /proc/cpuinfo 2>/dev/null"
-        " || nproc 2>/dev/null) | head -20;"
+        " || nproc 2>/dev/null) | head -n 100;"
     "echo '###CPUUSE'; (pidin times 2>/dev/null || cat /proc/stat 2>/dev/null)"
-        " | head -12;"
-    "echo '###MEM'; (pidin mem 2>/dev/null || free -m 2>/dev/null"
-        " || cat /proc/meminfo 2>/dev/null) | head -25;"
-    "echo '###PROC'; (top -b -i 1 2>/dev/null || top -b -n 1 2>/dev/null"
-        " || ps aux 2>/dev/null || ps -A 2>/dev/null) | head -40;"
+        " | head -n 300;"
+    "echo '###MEM'; (pidin mem 2>/dev/null | grep -E '^[ ]*[0-9]+[ ]+[0-9]+'"
+        " || cat /proc/meminfo 2>/dev/null"
+        " || free -m 2>/dev/null) | head -n 400;"
+    "echo '###NAME'; grep . /proc/[0-9]*/comm 2>/dev/null | head -n 400;"
+    "echo '###EXE'; ls -l /proc/[0-9]*/exe 2>/dev/null | head -n 400;"
+    "echo '###THREADS'; ls -d /proc/[0-9]*/task/[0-9]* 2>/dev/null | wc -l;"
+    "echo '###RSS'; grep . /proc/[0-9]*/statm 2>/dev/null | head -n 400;"
+    "echo '###PROC'; { "
+        "top -b -n 1 2>/dev/null | grep -q COMMAND && top -b -n 2 -d 1 2>/dev/null || "
+        "top -b -i 1 -z 100 2>/dev/null | grep -q COMMAND && top -b -i 1 -z 100 2>/dev/null || "
+        "ps aux 2>/dev/null | grep -q COMMAND && ps aux 2>/dev/null || "
+        "ps -A 2>/dev/null; "
+        "} | head -n 400;"
     "echo '###END'";
 
 /* Capture the output of a local shell command. Caller must free(). */
@@ -570,6 +675,24 @@ static void cmd_stats(const char *id)
         char *guest_out = ssh_exec_timeout(&g, STATS_CMD, guest_err,
                                            sizeof(guest_err), STATS_SSH_TIMEOUT);
         if (guest_out) {
+            /* The guest's own /proc/meminfo understates its RAM: a 4 GB
+               guest reports MemTotal 4026068 kB (3.84 GB) because the kernel
+               reserves ~4% for itself, so the Monitor's RAM tile read
+               "3.84 GB" for a guest actually configured with 4 GB. The
+               qvmconf's `ram` directive is the authoritative size -- tag the
+               stats so the parser can show the configured total instead. */
+            char ramconf[32] = "";
+            guest_conf_ram(&g, ramconf, sizeof(ramconf));
+            if (ramconf[0]) {
+                size_t need = strlen(guest_out) + strlen(ramconf) + 32;
+                char *tmp = realloc(guest_out, need);
+                if (tmp) {
+                    guest_out = tmp;
+                    strcat(guest_out, "\n###RAMCONF ");
+                    strcat(guest_out, ramconf);
+                    strcat(guest_out, "\n");
+                }
+            }
             escape_json(guest_out, guest_esc, 262144);
             free(guest_out);
             stats_cooloff_set(guest_id, 0);      /* it answered */
@@ -1015,18 +1138,72 @@ static void dispatch_command(const char *cmd)
 #define CMD_QUEUE_MAX 32
 #define CMD_WORKERS    4
 
+/* One in-flight-stats slot per possible target (the host, plus every guest).
+ *
+ * This used to be a single stats_running flag and a single stats_target
+ * string, sized for exactly one in-flight stats command at a time. That was
+ * fine while the Monitor page only ever asked about one thing (whichever
+ * guest the picker had selected). It stopped being fine the moment the page
+ * started polling the host and every running guest concurrently to show them
+ * all at once: a second concurrent target overwrote stats_target before the
+ * first had finished, so cmd_worker's "is the in-flight target still mine"
+ * check on completion compared against the WRONG target and could leave the
+ * single stats_running flag stuck at 1 -- after which every further stats
+ * request for whatever target happened to still be named there was silently
+ * dropped by the coalescing check below, forever.
+ *
+ * A slot per target removes the sharing: host and each guest get independent
+ * bookkeeping, so three stats requests in flight at once can be coalesced and
+ * completed without any of them clobbering another's state. */
+#define STATS_TARGET_SLOTS (MAX_GUESTS + 1)
+
 static struct {
     char            items[CMD_QUEUE_MAX][2048];
     int             head, tail, count;
-    int             stats_running;   /* see the coalescing note below */
-    char            stats_target[GUEST_ID_LEN];  /* which guest it is about */
+    struct {
+        char id[GUEST_ID_LEN];
+        int  used;
+    }               stats_targets[STATS_TARGET_SLOTS];
     pthread_mutex_t lock;
     pthread_cond_t  cv;
 } cmdq = {
-    .head = 0, .tail = 0, .count = 0, .stats_running = 0, .stats_target = "",
+    .head = 0, .tail = 0, .count = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cv   = PTHREAD_COND_INITIALIZER,
 };
+
+/* All three helpers require cmdq.lock to already be held. */
+static int stats_target_is_running(const char *target)
+{
+    for (int i = 0; i < STATS_TARGET_SLOTS; i++)
+        if (cmdq.stats_targets[i].used && strcmp(cmdq.stats_targets[i].id, target) == 0)
+            return 1;
+    return 0;
+}
+
+static void stats_target_start(const char *target)
+{
+    for (int i = 0; i < STATS_TARGET_SLOTS; i++)
+        if (!cmdq.stats_targets[i].used) {
+            cmdq.stats_targets[i].used = 1;
+            snprintf(cmdq.stats_targets[i].id, sizeof(cmdq.stats_targets[i].id), "%s", target);
+            return;
+        }
+    /* Every slot taken -- more concurrent targets than the host plus every
+       configured guest, which should not happen. Let it run without a slot
+       rather than drop it; the worst case is a duplicate not being
+       coalesced, not a stuck flag. */
+}
+
+static void stats_target_finish(const char *target)
+{
+    for (int i = 0; i < STATS_TARGET_SLOTS; i++)
+        if (cmdq.stats_targets[i].used && strcmp(cmdq.stats_targets[i].id, target) == 0) {
+            cmdq.stats_targets[i].used = 0;
+            cmdq.stats_targets[i].id[0] = '\0';
+            return;
+        }
+}
 
 static int is_stats_cmd(const char *c)
 {
@@ -1071,12 +1248,7 @@ static void *cmd_worker(void *arg)
 
         if (mine_is_stats) {
             pthread_mutex_lock(&cmdq.lock);
-            /* Only if the in-flight target is still ours. A stats for a
-               DIFFERENT guest admitted while this one ran has taken the slot
-               and named itself in stats_target; clearing the flag here would
-               release a slot that is not ours and let a third request in. */
-            if (strcmp(cmdq.stats_target, mine_target) == 0)
-                cmdq.stats_running = 0;
+            stats_target_finish(mine_target);
             pthread_mutex_unlock(&cmdq.lock);
         }
     }
@@ -1123,32 +1295,25 @@ static void handle_command(void *userdata, const char *cmd)
         stats_target_of(cmd, target, sizeof(target));
 
         /*
-         * Coalesce only a REPEAT of the question already being answered.
+         * Coalesce only a REPEAT of the question already being answered for
+         * THIS target. Each target (host, guest-1, guest-2, ...) has its own
+         * slot -- see stats_targets above -- so polling several concurrently
+         * (the Monitor page now does, to show every running guest at once)
+         * coalesces each one independently instead of the targets fighting
+         * over a single shared flag.
          *
-         * It used to coalesce on "is any stats running", which silently threw
-         * away the one request that matters most: the one sent the instant the
-         * user changes what they are looking at. The GUI's Monitor page
-         * requests immediately on a selection change, so switching from guest-1
-         * to host-only while a guest poll was in flight dropped the host
-         * request outright -- and the page then sat on "Fetching..." with its
-         * Refresh button disabled until its own 60s watchdog fired.
-         *
-         * The asymmetry that made it look arbitrary: a guest poll SSHes into
-         * the guest and takes ~21s, so switching away from a guest almost
-         * always lands inside that window. A host-only poll is local and
-         * sub-second, so switching the other way almost never does. Same bug,
-         * one direction hit constantly and the other effectively never.
-         *
-         * A repeat for the same target really is redundant -- it asks a
-         * question that is about to be answered -- so that one is still
-         * dropped, which is what keeps a polling GUI from backing HMS up.
+         * A repeat for a target already in flight really is redundant -- it
+         * asks a question that is about to be answered -- so that one is
+         * still dropped, which is what keeps a polling GUI from backing HMS
+         * up. A request for any OTHER target is never coalesced away, which
+         * is what stops switching what the page is looking at from dropping
+         * the one request that matters most.
          */
-        if (cmdq.stats_running && strcmp(cmdq.stats_target, target) == 0) {
+        if (stats_target_is_running(target)) {
             pthread_mutex_unlock(&cmdq.lock);
             return;
         }
-        cmdq.stats_running = 1;
-        snprintf(cmdq.stats_target, sizeof(cmdq.stats_target), "%s", target);
+        stats_target_start(target);
     }
 
     snprintf(cmdq.items[cmdq.tail], sizeof(cmdq.items[0]), "%s", cmd);

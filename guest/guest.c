@@ -1,6 +1,7 @@
 #include "guest.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -148,4 +149,51 @@ const char *guest_meta_conf(const Guest *g)
     static char buf[GUEST_PATH_LEN];
     snprintf(buf, sizeof(buf), "/guests/%s/.hms_metadata", g->id);
     return buf;
+}
+
+/* Read the qvmconf's `ram <base>,<size>` directive (e.g. "ram 0x80000000,4G")
+   and write the configured guest memory size in bytes to out ("" on error).
+   The guest kernel's own memory reporting understates this figure (a 4 GB
+   guest reports ~3.84 GB as MemTotal), so the config is the authoritative
+   size for the Monitor's RAM tile. */
+void guest_conf_ram(const Guest *g, char *out, size_t sz)
+{
+    out[0] = '\0';
+    if (!g->conf_path[0]) return;
+
+    FILE *f = fopen(g->conf_path, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "ram ", 4) != 0) continue;
+
+        char *comma = strchr(p + 4, ',');
+        if (comma) {
+            char *tok = comma + 1;
+            while (*tok == ' ' || *tok == '\t') tok++;
+            char *end = tok;
+            while (*end && *end != '\r' && *end != '\n' &&
+                   *end != ' ' && *end != '\t') end++;
+
+            size_t n = (size_t)(end - tok);
+            if (n > 0 && n < 32) {
+                char num[32];
+                memcpy(num, tok, n);
+                num[n] = '\0';
+
+                char suffix = num[n - 1];
+                long long v = strtoll(num, NULL, 10);
+                if (suffix == 'K' || suffix == 'k')      v *= 1024LL;
+                else if (suffix == 'M' || suffix == 'm') v *= 1024LL * 1024;
+                else if (suffix == 'G' || suffix == 'g') v *= 1024LL * 1024 * 1024;
+                else if (suffix == 'T' || suffix == 't') v *= 1024LL * 1024 * 1024 * 1024;
+                snprintf(out, sz, "%lld", v);
+            }
+        }
+        break;
+    }
+    fclose(f);
 }
