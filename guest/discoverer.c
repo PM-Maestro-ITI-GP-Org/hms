@@ -95,6 +95,87 @@ static void name_cache_put(const char *id, const char *name)
 }
 
 /*
+ * How long a guest has been failing the hostname probe, keyed by id.
+ *
+ * g->name_ts (on the Guest struct) looked like it throttled retries, but
+ * discover_one() memsets and re-zeroes every field -- name_ts included -- on
+ * every single refresh cycle, before refresh_guest_name() ever runs. So "now -
+ * g->name_ts < 10" compared "now" against a constant 0 every time: the
+ * throttle never throttled anything, and a still-booting guest's sshd got a
+ * fresh "uname -n" attempt on every refresh cycle (every hms.conf
+ * refresh_interval, 2-5s), not every 10s as the comment claimed.
+ *
+ * That is almost certainly what forced the later fix of caching the id
+ * fallback forever after the FIRST failure: with the real throttle silently
+ * broken, retrying "properly" meant retrying every cycle indefinitely, which
+ * is exactly the gate-starvation failure mode described below. Caching
+ * forever stopped that, but at the cost of giving a guest exactly one attempt
+ * -- and a guest that is simply slow to boot (cold SD read, graphics/Qt
+ * bring-up before sshd) fails that one attempt routinely and is stuck showing
+ * its bare id for the rest of its run.
+ *
+ * This table is what g->name_ts should have been: state that survives the
+ * scratch array being rebuilt from zero every cycle. It tracks WHEN the first
+ * failure happened, not just the last one, so retries can be bounded by
+ * elapsed time since the guest was first seen reachable-but-nameless, not by
+ * attempt count alone.
+ */
+static struct {
+    char   id[GUEST_ID_LEN];
+    time_t first_fail;
+    time_t last_attempt;
+} name_probe[MAX_GUESTS];
+
+/* Retry every 10s (same cadence the broken g->name_ts throttle intended) for
+   up to 2 minutes -- generous for a guest that is merely slow to bring sshd
+   up after a cold boot, per the timings measured while chasing this bug. Past
+   that, fall back to the old protective behaviour: cache the id and stop
+   asking, so a guest that genuinely never answers does not hold a gate slot
+   forever. */
+#define NAME_PROBE_INTERVAL_SEC 10
+#define NAME_PROBE_GIVEUP_SEC   120
+
+static void name_probe_get(const char *id, time_t *first_fail, time_t *last_attempt)
+{
+    for (int i = 0; i < MAX_GUESTS; i++) {
+        if (name_probe[i].id[0] && strcmp(name_probe[i].id, id) == 0) {
+            *first_fail = name_probe[i].first_fail;
+            *last_attempt = name_probe[i].last_attempt;
+            return;
+        }
+    }
+    *first_fail = 0;
+    *last_attempt = 0;
+}
+
+static void name_probe_record(const char *id, time_t now)
+{
+    for (int i = 0; i < MAX_GUESTS; i++) {
+        if (name_probe[i].id[0] && strcmp(name_probe[i].id, id) == 0) {
+            name_probe[i].last_attempt = now;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_GUESTS; i++) {
+        if (!name_probe[i].id[0]) {
+            snprintf(name_probe[i].id, sizeof(name_probe[i].id), "%s", id);
+            name_probe[i].first_fail = now;
+            name_probe[i].last_attempt = now;
+            return;
+        }
+    }
+}
+
+static void name_probe_clear(const char *id)
+{
+    for (int i = 0; i < MAX_GUESTS; i++)
+        if (name_probe[i].id[0] && strcmp(name_probe[i].id, id) == 0) {
+            name_probe[i].id[0] = '\0';
+            return;
+        }
+}
+
+/*
  * Scan the .hms_metadata file for HMS metadata keys (ip, ssh_user,
  * ssh_password, ssh_port, ssh_key, pid). Plain key=value lines; only writes
  * fields it finds and only into non-NULL outputs.
@@ -595,6 +676,7 @@ void refresh_guest_name(Guest *g)
         if (cached)
             name_cache_put(g->id, NULL);
         unreachable_forget(g->id);   /* so the next boot reports again */
+        name_probe_clear(g->id);     /* next boot gets its own retry window */
         g->name[0] = '\0';
         g->name_ts = 0;
         return;
@@ -630,27 +712,45 @@ void refresh_guest_name(Guest *g)
     }
 
     /*
-     * Fetch the hostname exactly once per boot, now that we know sshd is up.
+     * Fetch the hostname now that sshd is accepting, retried on a bounded
+     * schedule rather than once per boot.
      *
      * `uname -n` rather than `hostname`: the guest images carry the same toybox
      * as the host, and it has no hostname applet, so this always came back
      * empty and every guest showed its name as "-".
      *
-     * Still throttled: sshd accepting does not guarantee it will complete a
-     * handshake (that is the 5-6s path), so a guest that accepts but stalls
-     * must not be retried every cycle.
+     * Throttled via name_probe (see above), not via g->name_ts: g->name_ts
+     * lives on a Guest struct that discover_one() rebuilds from zero every
+     * refresh cycle, so it never actually throttled anything -- see the
+     * comment on name_probe. A guest whose sshd accepts but stalls partway
+     * through the handshake (the 5-6s path) is retried at most once every
+     * NAME_PROBE_INTERVAL_SEC, and only until NAME_PROBE_GIVEUP_SEC have
+     * passed since its first failure, so a guest that never answers cannot
+     * hold an ssh gate slot forever.
      */
     time_t now = time(NULL);
-    if (now - g->name_ts < 10)
+    time_t first_fail, last_attempt;
+    name_probe_get(g->id, &first_fail, &last_attempt);
+
+    if (first_fail && now - first_fail >= NAME_PROBE_GIVEUP_SEC) {
+        /* Gave it its window; stop paying for ssh attempts on this guest
+           until it restarts (name_probe_clear, above) or answers. */
+        snprintf(g->name, sizeof(g->name), "%s", g->id);
         return;
-    g->name_ts = now;
+    }
+    if (last_attempt && now - last_attempt < NAME_PROBE_INTERVAL_SEC) {
+        /* Mid-retry-window: show the id, but don't re-probe yet. */
+        if (g->name[0] == '\0')
+            snprintf(g->name, sizeof(g->name), "%s", g->id);
+        return;
+    }
 
     char why[512];
     /* 10s, not the 45s interactive cap. This runs inside refresh(), which the
        periodic loop and every command path calls, so whatever it waits for is
        added to how long the GUI waits to hear anything at all. `uname -n` on a
        healthy guest is instant; a guest that needs longer than ten seconds to
-       produce it is one whose name we can do without. */
+       produce it is one whose name we can do without on THIS attempt. */
     char *out = ssh_exec_timeout(g, "uname -n", why, sizeof(why), "10");
     if (!out) {
         if (!unreachable_announced(g->id)) {
@@ -659,25 +759,11 @@ void refresh_guest_name(Guest *g)
                    g->id, g->ssh_port > 0 ? g->ssh_port : 22,
                    why[0] ? why : "no reason given");
         }
-        /*
-         * Fall back to the guest's own id, and CACHE it, so this is not
-         * attempted again until the guest restarts.
-         *
-         * Not caching it was an own goal. The fallback filled in g->name for
-         * display but left the cache empty, so the next cycle saw no cached
-         * name and tried again -- one ssh every 10s, each holding one of the
-         * two gate slots for up to its full 45s timeout, forever. That is what
-         * starved `stats`: the bundle takes ~21s on its own, which fits the
-         * budget comfortably, but not while a hostname probe that will never
-         * succeed is permanently occupying half the gate. The Monitor page then
-         * reported "no response within 45s" for a guest that was fine.
-         *
-         * Losing the real hostname is a fair trade: it is cosmetic, the id is a
-         * perfectly good label, and the entry is evicted when the guest stops,
-         * so a restart gets one more chance at the real thing.
-         */
+        /* Show the id for now; name_probe remembers this failure so the next
+           refresh cycle waits out NAME_PROBE_INTERVAL_SEC before trying
+           again, rather than retrying every cycle or giving up for good. */
+        name_probe_record(g->id, now);
         snprintf(g->name, sizeof(g->name), "%s", g->id);
-        name_cache_put(g->id, g->name);
         return;
     }
 
@@ -694,6 +780,7 @@ void refresh_guest_name(Guest *g)
 
     if (g->name[0] != '\0') {
         name_cache_put(g->id, g->name);
+        name_probe_clear(g->id);     /* it answered; a future failure gets its own window */
         unreachable_forget(g->id);   /* it answered; report again if it stops */
         printf("  [hms] guest '%s' is up: %s\n", g->id, g->name);
     }
